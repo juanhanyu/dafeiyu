@@ -20,7 +20,8 @@ class Config:
     persona: str = os.getenv("BOT_PERSONA", "")
     owner_id: str = os.getenv("OWNER_ID", "")
     tz: ZoneInfo = ZoneInfo(os.getenv("TIMEZONE", "Asia/Shanghai"))
-    history_turns: int = int(os.getenv("HISTORY_TURNS", "10"))
+    # 记住最近几轮对话（一问一答算一轮）
+    history_turns: int = int(os.getenv("MEMORY_TURNS", "20"))
 
     llm_base_url: str = os.getenv("LLM_BASE_URL", "https://api.anthropic.com/v1/")
     llm_api_key: str = os.getenv("LLM_API_KEY", "")

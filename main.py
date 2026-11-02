@@ -72,6 +72,8 @@ class AtreiClient(botpy.Client):
         if self.http_session is None:  # 断线重连也会触发 on_ready，只初始化一次
             self.http_session = aiohttp.ClientSession()
             await self.brain.imagegen.load()
+            await self.brain.load_memory()
+            self.memory_task = asyncio.create_task(self.brain.memory.run_forever(self.brain.histories))
 
     # ---------- 收消息 ----------
     async def on_group_at_message_create(self, message: GroupMessage):
@@ -160,7 +162,7 @@ class AtreiClient(botpy.Client):
         if ctx.target_kind not in ("group", "c2c"):
             return False
         try:
-            silk = await self.brain.voice.synthesize(text)
+            silk = await self.brain.voice.synthesize(text, sing=ctx.sing)
             route = (Route("POST", "/v2/groups/{group_openid}/files", group_openid=ctx.target_id)
                      if ctx.target_kind == "group" else
                      Route("POST", "/v2/users/{openid}/files", openid=ctx.target_id))

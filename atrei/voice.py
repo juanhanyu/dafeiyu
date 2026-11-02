@@ -13,7 +13,8 @@ from pathlib import Path
 import aiohttp
 
 API = "https://api.breeze.blue/v1/text-to-speech/{voice_id}?output_format=mp3"
-ASK_FOR_VOICE = re.compile(r"语音|语言听|发个语言|声音|说给我听|念给我听|讲给我听|听你说|说句话|听听|开口|用嘴说")
+ASK_FOR_VOICE = re.compile(r"语音|语言听|发个语言|声音|说给我听|念给我听|讲给我听|听你说|说句话|听听|开口|用嘴说|唱|哼(?:首|个|一首|一段)")
+ASK_FOR_SONG = re.compile(r"唱|哼(?:首|个|一首|一段)")
 COOLDOWN_REPLIES = 15     # 自动发过一条语音后，至少隔这么多条回复才会再自动发
 CHANCE = 0.05             # 冷却结束后，每条回复自动发语音的概率
 MAX_CHARS = 120           # 太长的话不念，免得费积分
@@ -40,11 +41,11 @@ class Voice:
     def record(self, session_id: str, sent: bool):
         self.since_last[session_id] = 0 if sent else self.since_last[session_id] + 1
 
-    async def synthesize(self, text: str) -> bytes:
+    async def synthesize(self, text: str, sing: bool = False) -> bytes:
         """把文字变成 QQ 能播的 silk 语音。"""
         clean = re.sub(r"\[[^\[\]]{1,4}\]", "", EMOJI.sub("", text)).replace("~", "。").strip()[:MAX_CHARS]
         async with aiohttp.ClientSession() as s:
-            async with s.post(API.format(voice_id=self.voice_id), json={"text": clean},
+            async with s.post(API.format(voice_id=self.voice_id), json={"text": clean, **({"instructions": "用轻快可爱的调子哼唱出来，像在唱一首小曲"} if sing else {})},
                               # 不带自定义 User-Agent 会被 Cloudflare 当成爬虫拦下（error 1010）
                               headers={"xi-api-key": self.api_key, "user-agent": "dafeiyu-qq-bot/1.0"},
                               timeout=aiohttp.ClientTimeout(total=60)) as r:

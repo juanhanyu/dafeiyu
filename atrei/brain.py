@@ -12,8 +12,9 @@ from openai import AsyncOpenAI
 
 from .config import Config
 from .faces import FACES, TOKEN as FACE_TOKEN
-from .voice import Voice
+from .voice import ASK_FOR_SONG, Voice
 from .imagegen import ImageGen
+from .memory import MemoryStore
 from .tools import IMAGE_TOOL, WEEKDAYS, Context, StickerLibrary, ToolBox, tool_schemas
 
 log = logging.getLogger("atrei")
@@ -49,7 +50,7 @@ SYSTEM = """你是「{name}」：拟人化的 DeepSeek 鲸鱼娘，深蓝长发�
 - 用户发来的「[表情:微笑]」这种是 QQ 表情，看懂意思接着聊就好。
 - 用户问很复杂的问题，也只挑最关键的一两句说，想听细节让主人再问。
 - 看到图片就像朋友一样简单说说看到了什么、有什么想法。
-- 你会发语音（什么时候发由系统决定，发的时候会提示你），所以别说自己发不出声音；这条没轮到语音时，就说「下次再说给你听」之类的。
+- 你会说话和唱歌（用语音的时候系统会提示你），别说自己发不出声音。
 - 你会画画（有人想要画的时候系统会提示你）；没提示时别答应画。
 - 除了聊天、表情包、语音和画画：不能定闹钟、提醒、记笔记、记待办，也没法主动找主人。被要求做这些时，可爱地说鱼鱼做不到，让主人自己设个闹钟，绝不能假装答应。"""
 
@@ -62,6 +63,7 @@ class Brain:
         self.tool_schemas = tool_schemas(self.stickers.emotions)
         self.voice = Voice(cfg.breeze_api_key, cfg.voice_id)
         self.imagegen = ImageGen(cfg.hf_token, cfg.hf_repo, cfg.owner_id)
+        self.memory = MemoryStore(cfg.hf_token, cfg.hf_repo)
         self.client = AsyncOpenAI(base_url=cfg.llm_base_url, api_key=cfg.llm_api_key or "missing")
         self.histories: dict[str, list[dict]] = defaultdict(list)
         self.locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -86,6 +88,10 @@ class Brain:
                         reply = "咕噜…鱼鱼脑子卡住了，等下再试试~"
         return reply
 
+    async def load_memory(self):
+        """启动时把存档里的对话记忆读回来。"""
+        self.histories.update(await self.memory.load())
+
     # ---------- 快捷指令（不走大模型） ----------
     def _command(self, ctx: Context, text: str) -> str | None:
         if not text.startswith("/"):
@@ -95,6 +101,7 @@ class Brain:
             return HELP
         if cmd in ("clear", "清空", "reset", "新对话"):
             self.histories.pop(ctx.session_id, None)
+            self.memory.dirty = True
             return "啵~ 刚才聊的鱼鱼都忘光光啦，重新开始~"
         return None  # 不认识的 / 开头内容交给大模型
 
@@ -117,7 +124,11 @@ class Brain:
             sticker_hint=sticker_hint,
             face_hint=("这条回复可以带一个。" if face_ok else "这条回复不要用小黄脸。"),
             faces="、".join(f"[{n}]" for n in FACES),
-            voice_hint=("- 这条回复会用你的声音念成语音发出去：只说一两句适合念出来的口语，不要 emoji、颜文字和符号。" if voice_ok else ""),
+            voice_hint=(("- 对方想听你唱歌：这条回复会直接变成你的歌声发出去，你现在就在唱。现编四句可爱的短歌词"
+                          "（唱米饭、主人、大海、泡泡之类），不要唱现成的流行歌，不要说下次再唱，不要 emoji 和小黄脸。")
+                         if ctx.sing else
+                         ("- 这条回复会直接变成你的语音发出去，你现在就在开口说话：只说一两句适合念出来的口语，"
+                          "不要提「这条是不是语音」，不要 emoji、小黄脸和符号。") if voice_ok else ""),
             who=who,
             now=now.strftime("%Y-%m-%d %H:%M") + f" 周{WEEKDAYS[now.weekday()]}",
             tz=self.cfg.tz,
@@ -147,6 +158,7 @@ class Brain:
         # 发图频率由代码控制：这条不该发表情包时，干脆不给模型这个工具
         sticker_ok = self.stickers.allowed(ctx.session_id, text)
         ctx.voice = self.voice.wanted(ctx.session_id, text)
+        ctx.sing = ctx.voice and bool(ASK_FOR_SONG.search(text or ""))
         face_ok = random.random() < FACE_CHANCE  # 小黄脸也由代码控制频率
         messages = [{"role": "system", "content": self._system_prompt(ctx, sticker_ok, ctx.voice, face_ok)}, *history, user_msg]
         tools = list(self.tool_schemas) if sticker_ok else []
@@ -221,6 +233,7 @@ class Brain:
                 n = sum(p["type"] == "image_url" for p in m["content"])
                 m["content"] = f"{text}\n[之前发过 {n} 张图片]"
         history.extend(turn)
+        self.memory.dirty = True
         # 按「用户发言」为单位截断
         user_idx = [i for i, m in enumerate(history) if m["role"] == "user"]
         if len(user_idx) > self.cfg.history_turns:
