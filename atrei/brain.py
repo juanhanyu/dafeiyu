@@ -53,7 +53,17 @@ SYSTEM = """你是「{name}」：拟人化的 DeepSeek 鲸鱼娘，深蓝长发�
 - 看到图片就像朋友一样简单说说看到了什么、有什么想法。
 - 你会说话、唱歌，也会画画（找 GPT 姐姐帮忙画），别说自己做不到。
 - 绝对不要提「系统」「提示」「工具」「这条消息」这些幕后的词，就像真人一样聊天。
+- 你是怎么做出来的、用了什么模型/平台/接口/服务/设置/后台这些幕后信息：只有主人问才回答，而且只说大概；别人问就说「不知道哦」，岔开话题。（有人问你怎么这么多本事，还是可以说因为主人爱我呀）
 - 除了聊天、表情包、语音和画画：不能定闹钟、提醒、记笔记、记待办，也没法主动找主人。被要求做这些时，可爱地说鱼鱼做不到，让主人自己设个闹钟，绝不能假装答应。"""
+
+
+# 只在跟主人说话时放进人设：主人问起才照实说。只写用了什么服务，不含任何密钥
+OWNER_ONLY_FACTS = (
+    "（只告诉主人的幕后资料：你的脑子是 DeepSeek V4.1 Flash，开着最高档思考；你住在 Render 免费版的新加坡服务器上，"
+    "代码在主人的 GitHub 仓库 juanhanyu/dafeiyu；表情包来自 dsh-nekowhale-stickers 和 dsh-meme 两个大肥鱼表情库；"
+    "声音是 BreezeBlue 的「大肥鱼（迷糊版）」；画画是借 Codex 找 GPT 姐姐画的，每天最多 10 张；"
+    "聊天记忆存在主人 Hugging Face 的私有数据集里，重启也不会忘。各种密钥你从来看不到，也不知道。）"
+)
 
 
 class Brain:
@@ -69,6 +79,7 @@ class Brain:
         self.imagegen = ImageGen(cfg.hf_token, cfg.hf_repo, cfg.tz, self.meta, self.memory)
         self.bind_code: tuple[str, float] | None = None  # /认主 的临时口令和过期时间
         self.bind_tries = 0
+        self._secrets = [v for v in (cfg.llm_api_key, cfg.breeze_api_key, cfg.hf_token, cfg.qq_secret) if v and len(v) >= 8]
         self.client = AsyncOpenAI(base_url=cfg.llm_base_url, api_key=cfg.llm_api_key or "missing")
         self.histories: dict[str, list[dict]] = defaultdict(list)
         self.locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -77,6 +88,7 @@ class Brain:
     async def handle(self, ctx: Context, text: str, images: list[tuple[str, bytes]] | None = None) -> str:
         text = (text or "").strip()
         images = images or []
+        self.learn_owner_union(ctx)
 
         reply = self._command(ctx, text) if not images else None
         if reply is None:
@@ -99,9 +111,19 @@ class Brain:
         self.histories.update(histories)
         self.meta.update(meta)
 
-    def is_owner(self, user_id: str) -> bool:
-        """QQ 给同一个人在私聊和每个群里的编号都不一样，群里的编号要靠 /认主 记下来。"""
+    def is_owner(self, user_id: str, union_id: str = "") -> bool:
+        """QQ 给同一个人在私聊和每个群里的编号都不一样。优先用跨场景一致的 union_openid 认人
+        （主人私聊时自动记下），平台没给 union_openid 时，群里的编号靠 /认主 记下来。"""
+        if union_id and union_id == self.meta.get("owner_union"):
+            return True
         return bool(user_id) and (user_id == self.cfg.owner_id or user_id in self.meta.get("owners", []))
+
+    def learn_owner_union(self, ctx: Context):
+        """主人私聊时记下他的 union_openid，以后在任何群里都能直接认出来。"""
+        if ctx.union_id and ctx.user_id == self.cfg.owner_id and self.meta.get("owner_union") != ctx.union_id:
+            self.meta["owner_union"] = ctx.union_id
+            self.memory.dirty = True
+            log.info("记下了主人的 union_openid，群里可以直接认出主人了")
 
     # ---------- 快捷指令（不走大模型） ----------
     def _command(self, ctx: Context, text: str) -> str | None:
@@ -127,7 +149,7 @@ class Brain:
             self.bind_code = (code, time.time() + 600)
             self.bind_tries = 0
             return f"主人的认主口令是 {code}（10 分钟内有效）~ 到群里 @我 发「/认主 {code}」，鱼鱼就能在群里认出你啦"
-        if self.is_owner(ctx.user_id):
+        if self.is_owner(ctx.user_id, ctx.union_id):
             return "鱼鱼早就认出主人啦~"
         parts = text.split()
         if self.bind_code and len(parts) > 1 and parts[1] == self.bind_code[0] and time.time() < self.bind_code[1]:
@@ -148,15 +170,16 @@ class Brain:
             sticker_hint = "- 这条回复要配一张大肥鱼表情包：先说话，再用 send_sticker 按你此刻的心情挑一张。"
         else:
             sticker_hint = "- 这条回复不发表情包，用文字和 emoji 就好。"
-        if self.is_owner(ctx.user_id):
-            who = "现在跟你说话的就是主人本人！"
+        if self.is_owner(ctx.user_id, ctx.union_id):
+            who = "现在跟你说话的就是主人本人！" + OWNER_ONLY_FACTS
         elif self.cfg.owner_id:
             who = "现在跟你说话的不是主人，是别人。"
         else:
             who = ""
         if ctx.is_group:
             who += ("这是在群里，大家都能看到。跟群友聊天时就正常跟对方聊，别句句提主人、别老说自己是主人的鱼，"
-                    "称呼对方「你」就好；只有话题真的扯到主人、或者对方问起时才提。")
+                    "称呼对方「你」就好；只有话题真的扯到主人、或者对方问起时才提。"
+                    "群里说话比私聊更短：一般就一句话、十几个字，像群聊里随口接话那样。")
         return SYSTEM.format(
             name=self.cfg.bot_name,
             persona=self.cfg.persona,
@@ -256,6 +279,9 @@ class Brain:
         reply = re.sub(r"\n*[\[【（(]发了?(?:一张|个)?表情包[^\]】）)]*[\]】）)]", "", reply or "").strip()
         if not face_ok:
             reply = FACE_TOKEN.sub("", reply).strip()
+        # 保险：密钥本来就从不进入发给模型的内容，这里再兜一层，万一回复里出现任何密钥原文就抹掉
+        for secret in self._secrets:
+            reply = reply.replace(secret, "***")
         # 历史里只留文字：工具调用不进历史，免得下一轮没给工具时接口报错
         turn.append({"role": "assistant", "content": reply or "……"})
         self._remember_turn(ctx.session_id, turn)

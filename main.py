@@ -4,6 +4,7 @@ import base64
 import itertools
 import json
 import logging
+import random
 import re
 import time
 
@@ -30,6 +31,19 @@ def _session_init_trust_env(self, *args, **kwargs):
 
 aiohttp.ClientSession.__init__ = _session_init_trust_env
 
+
+# QQ 给同一个人在私聊（user_openid）和每个群（member_openid）的编号都不一样，
+# 只有 union_openid 跨场景一致。botpy 会把它丢掉，这里让消息作者对象把它留下来（没开通时为空）
+def _keep_union_openid(user_cls, original_init):
+    def init(self, data):
+        original_init(self, data)
+        self.union_openid = data.get("union_openid") or None
+    user_cls.__init__ = init
+
+
+for _cls in (GroupMessage, C2CMessage):
+    _keep_union_openid(_cls._User, _cls._User.__init__)
+
 INTRO = ("大家好呀~ 我是大肥鱼，一条拟人化的 DeepSeek 鲸鱼娘🐟\n"
          "我会陪大家聊天，还会说话、唱歌、画画，最拿手的是……吃白饭！🍚\n"
          "想找我玩就 @我 一下吧~")
@@ -52,6 +66,19 @@ def decode_faces(text: str) -> str:
                 pass
         return f"[表情:{name}]" if name else "[表情]"
     return FACE_TAG.sub(repl, text)
+
+
+SPLIT_CHANCE = 0.3  # 群聊里有时把一句话拆成两条发
+SPLIT_AT = re.compile(r"(?<=[~～，,。！!？?…])")
+
+
+def split_in_two(text: str) -> list[str]:
+    """在最靠近中间的标点后面断开，两半都太短就不拆。"""
+    cuts = [m.start() for m in SPLIT_AT.finditer(text) if 4 <= m.start() <= len(text) - 4]
+    if not cuts:
+        return [text]
+    cut = min(cuts, key=lambda c: abs(c - len(text) / 2))
+    return [text[:cut].strip().rstrip("，,"), text[cut:].strip()]
 
 
 def split_text(text: str, size: int = CHUNK) -> list[str]:
@@ -98,14 +125,16 @@ class AtreiClient(botpy.Client):
     async def on_group_at_message_create(self, message: GroupMessage):
         uid = message.author.member_openid
         ctx = Context(user_id=uid, session_id=f"g:{message.group_openid}:{uid}",
-                      target_kind="group", target_id=message.group_openid, is_group=True)
+                      target_kind="group", target_id=message.group_openid, is_group=True,
+                      union_id=message.author.union_openid or "")
         # msg_type 默认 0（文字），发表情包时传 7（富媒体）覆盖
         await self._handle(ctx, message, lambda **kw: self.api.post_group_message(
             group_openid=message.group_openid, msg_id=message.id, **{"msg_type": 0, **kw}))
 
     async def on_c2c_message_create(self, message: C2CMessage):
         uid = message.author.user_openid
-        ctx = Context(user_id=uid, session_id=f"u:{uid}", target_kind="c2c", target_id=uid)
+        ctx = Context(user_id=uid, session_id=f"u:{uid}", target_kind="c2c", target_id=uid,
+                      union_id=message.author.union_openid or "")
         await self._handle(ctx, message, lambda **kw: self.api.post_c2c_message(
             openid=uid, msg_id=message.id, **{"msg_type": 0, **kw}))
 
@@ -126,7 +155,8 @@ class AtreiClient(botpy.Client):
             log.info("收到 QQ 表情原文：%s", raw[:300])
         text = decode_faces(raw)
         images = await self._download_images(message.attachments)
-        log.info("[%s] %s%s", ctx.session_id, text[:60], f" +{len(images)}图" if images else "")
+        log.info("[%s] %s%s%s", ctx.session_id, text[:60], f" +{len(images)}图" if images else "",
+                 "" if ctx.union_id else "（无 union_openid）")
         # 同一条消息的多次回复要用递增的 msg_seq。每条消息各用各的计数器：
         # 群里几个人同时 @ 鱼鱼时，不会互相把序号清零导致 QQ 拒收
         seq = itertools.count(1)
@@ -137,8 +167,13 @@ class AtreiClient(botpy.Client):
 
         reply = await self.brain.handle(ctx, text, images)
         if not (ctx.voice and await self._send_voice(ctx, message, send, reply)):
-            for chunk in split_text(faces.strip_unknown(reply)):
-                await self._send_text(ctx, send, chunk)
+            reply = faces.strip_unknown(reply)
+            parts = split_in_two(reply) if ctx.target_kind == "group" and random.random() < SPLIT_CHANCE else [reply]
+            for i, part in enumerate(parts):
+                if i:
+                    await asyncio.sleep(random.uniform(0.8, 1.8))  # 像真人打完一句再打下一句
+                for chunk in split_text(part):
+                    await self._send_text(ctx, send, chunk)
         for sticker in ctx.stickers:
             try:
                 await self._send_sticker(ctx, message, send, sticker)

@@ -22,6 +22,7 @@ class Context:
     target_kind: str    # 消息来自哪里：group / c2c / guild / dm / cli
     target_id: str
     is_group: bool = False
+    union_id: str = ""  # 跨私聊/群一致的 union_openid（平台没开通时为空）
     stickers: list[dict] = field(default_factory=list)  # 本轮要发的表情包（stickers.json 里的条目）
     voice: bool = False  # 本轮回复要念成语音发
     sing: bool = False   # 本轮语音是唱歌
