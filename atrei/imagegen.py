@@ -14,7 +14,7 @@ import os
 import platform
 import re
 import time
-from datetime import date
+from datetime import datetime
 
 import aiohttp
 
@@ -32,13 +32,13 @@ ASK_FOR_IMAGE = re.compile(r"画|图|照片|相片|自拍|生成|P一张|p一张
 
 
 class ImageGen:
-    def __init__(self, hf_token: str, hf_repo: str, owner_id: str):
+    def __init__(self, hf_token: str, hf_repo: str, tz, meta: dict, memory):
         self.hf_token = hf_token
         self.hf_repo = hf_repo
-        self.owner_id = owner_id
+        self.tz = tz          # 按北京时间算「今天」（服务器是 UTC）
+        self.meta = meta      # 当天用量存在这里，跟着对话记忆一起存档，重启不清零
+        self.memory = memory
         self.auth: dict | None = None
-        self.used_today = 0
-        self.day = date.today()
         self.lock = asyncio.Lock()
 
     # ---------- 状态 ----------
@@ -50,10 +50,13 @@ class ImageGen:
         """有人提到画图时，才把生图工具交给模型（所有人都能用，全天共用一个上限）。"""
         return self.enabled and bool(ASK_FOR_IMAGE.search(text or ""))
 
+    def _today(self) -> str:
+        return datetime.now(self.tz).date().isoformat()
+
     def quota_left(self) -> int:
-        if self.day != date.today():
-            self.day, self.used_today = date.today(), 0
-        return DAILY_LIMIT - self.used_today
+        if self.meta.get("image_day") != self._today():
+            self.meta["image_day"], self.meta["image_used"] = self._today(), 0
+        return DAILY_LIMIT - self.meta["image_used"]
 
     # ---------- 登录信息的存取 ----------
     async def load(self):
@@ -136,5 +139,6 @@ class ImageGen:
                         raise RuntimeError(f"生图失败 {r.status}: {(await r.text())[:200]}")
                     data = await r.json()
                     break
-        self.used_today += 1
+        self.meta["image_used"] = self.meta.get("image_used", 0) + 1
+        self.memory.dirty = True
         return base64.b64decode(data["data"][0]["b64_json"])

@@ -1,6 +1,7 @@
 """QQ 官方机器人入口：python main.py"""
 import asyncio
 import base64
+import itertools
 import json
 import logging
 import re
@@ -9,6 +10,7 @@ import time
 import aiohttp
 import botpy
 from botpy.http import Route
+from botpy.manage import GroupManageEvent
 from botpy.message import C2CMessage, DirectMessage, GroupMessage, Message
 
 from atrei import config, faces, hf
@@ -27,6 +29,10 @@ def _session_init_trust_env(self, *args, **kwargs):
 
 
 aiohttp.ClientSession.__init__ = _session_init_trust_env
+
+INTRO = ("大家好呀~ 我是大肥鱼，一条拟人化的 DeepSeek 鲸鱼娘🐟\n"
+         "我会陪大家聊天，还会说话、唱歌、画画，最拿手的是……吃白饭！🍚\n"
+         "想找我玩就 @我 一下吧~")
 
 CHUNK = 1500          # 单条消息最大字数，超出分条发
 
@@ -64,8 +70,6 @@ class AtreiClient(botpy.Client):
         self.cfg = cfg
         self.brain = brain
         self.http_session: aiohttp.ClientSession | None = None
-        # target_id -> [最近一条用户消息 id, 时间, 已用 msg_seq]，同一条消息的多次回复要递增 msg_seq
-        self.last_msg: dict[str, list] = {}
 
     async def on_ready(self):
         log.info("「%s」上线了", self.robot.name)
@@ -73,7 +77,22 @@ class AtreiClient(botpy.Client):
             self.http_session = aiohttp.ClientSession()
             await self.brain.imagegen.load()
             await self.brain.load_memory()
-            self.memory_task = asyncio.create_task(self.brain.memory.run_forever(self.brain.histories))
+            self.memory_task = asyncio.create_task(self.brain.memory.run_forever(self.brain.histories, self.brain.meta))
+
+    # ---------- 被拉进群 ----------
+    async def on_group_add_robot(self, event: GroupManageEvent):
+        """刚进群时自我介绍一次。这个事件只在真的被拉进群时才有，重启不会再触发；再记一笔防止重复。"""
+        intro_done = self.brain.meta.setdefault("introduced_groups", [])
+        if event.group_openid in intro_done:
+            return
+        try:
+            await self.api.post_group_message(group_openid=event.group_openid, msg_type=0, content=INTRO,
+                                              event_id=event.event_id, msg_seq=1)
+            intro_done.append(event.group_openid)
+            self.brain.memory.dirty = True
+            log.info("在新群 %s 自我介绍了", event.group_openid)
+        except Exception as e:
+            log.warning("进群自我介绍失败：%s", e)
 
     # ---------- 收消息 ----------
     async def on_group_at_message_create(self, message: GroupMessage):
@@ -108,7 +127,13 @@ class AtreiClient(botpy.Client):
         text = decode_faces(raw)
         images = await self._download_images(message.attachments)
         log.info("[%s] %s%s", ctx.session_id, text[:60], f" +{len(images)}图" if images else "")
-        self.last_msg[ctx.target_id] = [message.id, time.time(), 0]
+        # 同一条消息的多次回复要用递增的 msg_seq。每条消息各用各的计数器：
+        # 群里几个人同时 @ 鱼鱼时，不会互相把序号清零导致 QQ 拒收
+        seq = itertools.count(1)
+        reply_to = send
+
+        async def send(**kw):
+            return await reply_to(msg_seq=next(seq), **kw)
 
         reply = await self.brain.handle(ctx, text, images)
         if not (ctx.voice and await self._send_voice(ctx, message, send, reply)):
@@ -126,10 +151,8 @@ class AtreiClient(botpy.Client):
     async def _send_text(self, ctx: Context, send, text: str):
         """带 [可爱] 这类 QQ 表情的回复用 Markdown 发（黄脸是行内小图），失败或频道里就去掉表情发文字。"""
         if faces.has_faces(text) and ctx.target_kind in ("group", "c2c"):
-            state = self.last_msg[ctx.target_id]
-            state[2] += 1
             try:
-                await send(msg_type=2, markdown={"content": faces.to_markdown(text)}, msg_seq=state[2])
+                await send(msg_type=2, markdown={"content": faces.to_markdown(text)})
                 return
             except Exception as e:
                 log.warning("Markdown 表情发送失败，改发文字：%s", e)
@@ -148,9 +171,7 @@ class AtreiClient(botpy.Client):
                      Route("POST", "/v2/users/{openid}/files", openid=ctx.target_id))
             uploaded = await self.api._http.request(route, json={
                 "file_type": 1, "file_data": base64.b64encode(png).decode(), "srv_send_msg": False})
-            state = self.last_msg[ctx.target_id]
-            state[2] += 1
-            await send(msg_type=7, content=" ", media={"file_info": uploaded["file_info"]}, msg_seq=state[2])
+            await send(msg_type=7, content=" ", media={"file_info": uploaded["file_info"]})
         except Exception as e:
             log.warning("画图失败：%s", e)
             text = ("本鱼今天已经没脸找GPT姐姐画画啦~" if "用完" in str(e)
@@ -168,9 +189,7 @@ class AtreiClient(botpy.Client):
                      Route("POST", "/v2/users/{openid}/files", openid=ctx.target_id))
             uploaded = await self.api._http.request(route, json={
                 "file_type": 3, "file_data": base64.b64encode(silk).decode(), "srv_send_msg": False})
-            state = self.last_msg[ctx.target_id]
-            state[2] += 1
-            await send(msg_type=7, content=" ", media={"file_info": uploaded["file_info"]}, msg_seq=state[2])
+            await send(msg_type=7, content=" ", media={"file_info": uploaded["file_info"]})
             log.info("发了语音：%s", text[:40])
             return True
         except Exception as e:
@@ -194,21 +213,15 @@ class AtreiClient(botpy.Client):
                 data = await r.read()
             uploaded = await self.api._http.request(route, json={
                 "file_type": 1, "file_data": base64.b64encode(data).decode(), "srv_send_msg": False})
-        state = self.last_msg[ctx.target_id]
-        state[2] += 1
-        await send(msg_type=7, content=" ", media={"file_info": uploaded["file_info"]}, msg_seq=state[2])
+        await send(msg_type=7, content=" ", media={"file_info": uploaded["file_info"]})
 
     async def _send_passive(self, target_id, send, content):
-        state = self.last_msg[target_id]
-        state[2] += 1
         try:
-            await send(content=content, msg_seq=state[2])
+            await send(content=content)
         except Exception as e:
             log.warning("发送失败：%s", e)
             if "url" in str(e).lower() or "链接" in str(e):
-                await send(content=re.sub(r"https?://\S+|\b\w+\.(com|cn|net|org)\S*", "[链接已隐藏]", content),
-                           msg_seq=state[2] + 1)
-                state[2] += 1
+                await send(content=re.sub(r"https?://\S+|\b\w+\.(com|cn|net|org)\S*", "[链接已隐藏]", content))
 
     async def _download_images(self, attachments) -> list[tuple[str, bytes]]:
         images = []

@@ -5,6 +5,7 @@ import json
 import logging
 import random
 import re
+import time
 from collections import defaultdict
 from datetime import datetime
 
@@ -62,8 +63,12 @@ class Brain:
         self.tools = ToolBox(self.stickers)
         self.tool_schemas = tool_schemas(self.stickers.emotions)
         self.voice = Voice(cfg.breeze_api_key, cfg.voice_id)
-        self.imagegen = ImageGen(cfg.hf_token, cfg.hf_repo, cfg.owner_id)
         self.memory = MemoryStore(cfg.hf_token, cfg.hf_repo)
+        # 要长期保留的小设置：认过的主人编号、自我介绍过的群、当天画了几张（随对话一起存档）
+        self.meta: dict = {}
+        self.imagegen = ImageGen(cfg.hf_token, cfg.hf_repo, cfg.tz, self.meta, self.memory)
+        self.bind_code: tuple[str, float] | None = None  # /认主 的临时口令和过期时间
+        self.bind_tries = 0
         self.client = AsyncOpenAI(base_url=cfg.llm_base_url, api_key=cfg.llm_api_key or "missing")
         self.histories: dict[str, list[dict]] = defaultdict(list)
         self.locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -89,8 +94,14 @@ class Brain:
         return reply
 
     async def load_memory(self):
-        """启动时把存档里的对话记忆读回来。"""
-        self.histories.update(await self.memory.load())
+        """启动时把存档里的对话记忆和小设置读回来。"""
+        histories, meta = await self.memory.load()
+        self.histories.update(histories)
+        self.meta.update(meta)
+
+    def is_owner(self, user_id: str) -> bool:
+        """QQ 给同一个人在私聊和每个群里的编号都不一样，群里的编号要靠 /认主 记下来。"""
+        return bool(user_id) and (user_id == self.cfg.owner_id or user_id in self.meta.get("owners", []))
 
     # ---------- 快捷指令（不走大模型） ----------
     def _command(self, ctx: Context, text: str) -> str | None:
@@ -103,7 +114,32 @@ class Brain:
             self.histories.pop(ctx.session_id, None)
             self.memory.dirty = True
             return "啵~ 刚才聊的鱼鱼都忘光光啦，重新开始~"
+        if cmd in ("认主", "bind"):
+            return self._bind_owner(ctx, text)
         return None  # 不认识的 / 开头内容交给大模型
+
+    def _bind_owner(self, ctx: Context, text: str) -> str:
+        """主人先在私聊发 /认主 拿口令，再在群里 @鱼鱼 发「/认主 口令」，鱼鱼就记住主人在这个群里的编号。"""
+        if not ctx.is_group:
+            if ctx.user_id != self.cfg.owner_id:
+                return "哼，本鱼只认一个主人，你不是啦~"
+            code = f"{random.randint(0, 999999):06d}"
+            self.bind_code = (code, time.time() + 600)
+            self.bind_tries = 0
+            return f"主人的认主口令是 {code}（10 分钟内有效）~ 到群里 @我 发「/认主 {code}」，鱼鱼就能在群里认出你啦"
+        if self.is_owner(ctx.user_id):
+            return "鱼鱼早就认出主人啦~"
+        parts = text.split()
+        if self.bind_code and len(parts) > 1 and parts[1] == self.bind_code[0] and time.time() < self.bind_code[1]:
+            self.meta.setdefault("owners", []).append(ctx.user_id)
+            self.bind_code = None
+            self.memory.dirty = True
+            return "认出来啦！原来主人在这里~ 以后在群里鱼鱼也能认出你了"
+        if self.bind_code:  # 防止有人一直猜：错 5 次口令作废
+            self.bind_tries += 1
+            if self.bind_tries >= 5:
+                self.bind_code = None
+        return "口令不对哦，想认主请主人先私聊鱼鱼发 /认主"
 
     # ---------- 大模型 ----------
     def _system_prompt(self, ctx: Context, sticker_ok: bool, voice_ok: bool = False, face_ok: bool = True) -> str:
@@ -112,7 +148,7 @@ class Brain:
             sticker_hint = "- 这条回复要配一张大肥鱼表情包：先说话，再用 send_sticker 按你此刻的心情挑一张。"
         else:
             sticker_hint = "- 这条回复不发表情包，用文字和 emoji 就好。"
-        if self.cfg.owner_id and ctx.user_id == self.cfg.owner_id:
+        if self.is_owner(ctx.user_id):
             who = "现在跟你说话的就是主人本人！"
         elif self.cfg.owner_id:
             who = "现在跟你说话的不是主人，是别人。"
