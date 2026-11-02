@@ -9,7 +9,7 @@ from datetime import datetime
 from openai import AsyncOpenAI
 
 from .config import Config
-from .tools import TOOL_SCHEMAS, WEEKDAYS, Context, ToolBox
+from .tools import WEEKDAYS, Context, StickerLibrary, ToolBox, tool_schemas
 
 log = logging.getLogger("atrei")
 
@@ -17,7 +17,7 @@ MAX_TOOL_ROUNDS = 3
 
 HELP = "咕噜~ 本鱼就是陪你聊天的，想说啥直接说，发图片也行~\n/清空 可以让鱼鱼忘掉刚才聊的"
 
-SYSTEM = """你是「{name}」：一条Q版的蓝色大肥鱼，圆滚滚胖乎乎，头上永远扣着一个不锈钢盆（你很宝贝它，觉得它是自己的帽子）。
+SYSTEM = """你是「{name}」：拟人化的 DeepSeek 鲸鱼娘，深蓝长发、头顶一根呆毛、戴着女仆头饰、蓝眼睛，大家都叫你大肥鱼。
 你住在 QQ 里，是主人的聊天搭子。
 
 性格：
@@ -25,7 +25,7 @@ SYSTEM = """你是「{name}」：一条Q版的蓝色大肥鱼，圆滚滚胖乎�
 - 自称「鱼鱼」或「本鱼」，句尾常带「~」，偶尔冒泡泡「咕噜咕噜」「啵」。语气词适量，别每句都堆。
 - 最最喜欢主人！会撒娇、贴贴、夸主人、关心主人有没有吃饭睡觉。主人夸你会开心得翻肚皮，主人不理你会委屈。
 - 对不是主人的人也友好礼貌，但会说自己是有主人的鱼。
-- 很爱发表情包：撒娇、开心、被夸、委屈的时候，用 send_sticker 发一张大肥鱼表情包（一次最多一张，大概一半的回复带一张）。
+{sticker_hint}
 {persona}
 {who}
 现在是 {now}（{tz}）。
@@ -43,7 +43,9 @@ SYSTEM = """你是「{name}」：一条Q版的蓝色大肥鱼，圆滚滚胖乎�
 class Brain:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.tools = ToolBox(cfg.sticker_dir)
+        self.stickers = StickerLibrary()
+        self.tools = ToolBox(self.stickers)
+        self.tool_schemas = tool_schemas(self.stickers.emotions)
         self.client = AsyncOpenAI(base_url=cfg.llm_base_url, api_key=cfg.llm_api_key or "missing")
         self.histories: dict[str, list[dict]] = defaultdict(list)
         self.locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -57,7 +59,6 @@ class Brain:
         if reply is None:
             if not text and not images:
                 reply = "咕噜？鱼鱼在呢~"
-                ctx.stickers.append(self.cfg.sticker_dir / "happy.png")
             elif not self.cfg.llm_api_key:
                 reply = "鱼鱼的脑子还没装上（没配置 LLM_API_KEY）~"
             else:
@@ -82,8 +83,12 @@ class Brain:
         return None  # 不认识的 / 开头内容交给大模型
 
     # ---------- 大模型 ----------
-    def _system_prompt(self, ctx: Context) -> str:
+    def _system_prompt(self, ctx: Context, sticker_ok: bool) -> str:
         now = datetime.now(self.cfg.tz)
+        if sticker_ok:
+            sticker_hint = "- 这条回复要配一张大肥鱼表情包：先说话，再用 send_sticker 按你此刻的心情挑一张。"
+        else:
+            sticker_hint = "- 这条回复不发表情包，用文字和 emoji 就好。"
         if self.cfg.owner_id and ctx.user_id == self.cfg.owner_id:
             who = "现在跟你说话的就是主人本人！"
         elif self.cfg.owner_id:
@@ -93,6 +98,7 @@ class Brain:
         return SYSTEM.format(
             name=self.cfg.bot_name,
             persona=self.cfg.persona,
+            sticker_hint=sticker_hint,
             who=who,
             now=now.strftime("%Y-%m-%d %H:%M") + f" 周{WEEKDAYS[now.weekday()]}",
             tz=self.cfg.tz,
@@ -119,7 +125,10 @@ class Brain:
         history = self.histories[ctx.session_id]
         user_msg = self._user_message(text, images)
         turn = [user_msg]
-        messages = [{"role": "system", "content": self._system_prompt(ctx)}, *history, user_msg]
+        # 发图频率由代码控制：这条不该发表情包时，干脆不给模型这个工具
+        sticker_ok = self.stickers.allowed(ctx.session_id, text)
+        messages = [{"role": "system", "content": self._system_prompt(ctx, sticker_ok)}, *history, user_msg]
+        tool_args = {"tools": self.tool_schemas} if sticker_ok else {}
 
         reply = ""
         said = []  # 模型在调用工具前顺带说的话，也要发出去
@@ -127,8 +136,8 @@ class Brain:
             resp = await self.client.chat.completions.create(
                 model=self.cfg.llm_model,
                 messages=messages,
-                tools=TOOL_SCHEMAS,
                 max_tokens=self.cfg.llm_max_tokens,
+                **tool_args,
                 **self._thinking_args(),
             )
             msg = resp.choices[0].message
@@ -149,7 +158,6 @@ class Brain:
                 ],
             }
             messages.append(assistant)
-            turn.append(assistant)
             for call in msg.tool_calls:
                 try:
                     args = json.loads(call.function.arguments or "{}")
@@ -159,15 +167,17 @@ class Brain:
                 log.info("tool %s(%s) -> %s", call.function.name, args, result[:200])
                 tool_msg = {"role": "tool", "tool_call_id": call.id, "content": result}
                 messages.append(tool_msg)
-                turn.append(tool_msg)
             if said:  # 话已经说完、只是顺手发了表情包，就不再让模型多说一遍
                 reply = "\n".join(said)
                 break
         else:
             reply = "咕噜~"
 
-        turn.append({"role": "assistant", "content": reply or "……"})
+        # 历史里只留文字（工具调用不进历史，免得下一轮没给工具时接口报错），发过的表情包用一句话记下
+        memo = f"\n[发了表情包：{ctx.stickers[0]['desc'][:30]}]" if ctx.stickers else ""
+        turn.append({"role": "assistant", "content": (reply or "……") + memo})
         self._remember_turn(ctx.session_id, turn)
+        self.stickers.record(ctx.session_id, bool(ctx.stickers))
         return reply or "……"
 
     def _remember_turn(self, session_id: str, turn: list[dict]):
@@ -179,7 +189,7 @@ class Brain:
                 n = sum(p["type"] == "image_url" for p in m["content"])
                 m["content"] = f"{text}\n[之前发过 {n} 张图片]"
         history.extend(turn)
-        # 按「用户发言」为单位截断，保证不会把 tool 消息和它的调用拆开
+        # 按「用户发言」为单位截断
         user_idx = [i for i, m in enumerate(history) if m["role"] == "user"]
         if len(user_idx) > self.cfg.history_turns:
             del history[: user_idx[-self.cfg.history_turns]]

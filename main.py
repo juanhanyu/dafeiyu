@@ -114,11 +114,12 @@ class AtreiClient(botpy.Client):
         reply = await self.brain.handle(ctx, text, images)
         for chunk in split_text(reply):
             await self._send_passive(ctx.target_id, send, chunk)
-        for path in ctx.stickers:
+        for sticker in ctx.stickers:
             try:
-                await self._send_image(ctx, message, send, path)
+                await self._send_sticker(ctx, message, send, sticker)
+                log.info("发了表情包 %s", sticker["id"])
             except Exception as e:
-                log.warning("表情包发送失败：%s", e)
+                log.warning("表情包 %s 发送失败：%s", sticker["id"], e)
 
     async def _face_test(self, ctx: Context, raw: str, send):
         """实验：用几种写法发「微笑」，看 QQ 里哪种能显示成真正的 QQ 表情。"""
@@ -140,17 +141,23 @@ class AtreiClient(botpy.Client):
                 log.warning("表情测试 %s 失败：%s", label, e)
         log.info("表情测试已发出 %s", [v[0] for v in variants])
 
-    async def _send_image(self, ctx: Context, message, send, path):
-        data = path.read_bytes()
+    async def _send_sticker(self, ctx: Context, message, send, sticker: dict):
+        url = sticker["url"]
         if ctx.target_kind in ("guild", "dm"):
-            await message.reply(file_image=data)
+            await message.reply(image=url)
             return
-        # 群/私聊：先把图片上传成富媒体，再发 msg_type=7
+        # 群/私聊：先把图片上传成富媒体，再发 msg_type=7。先让 QQ 按网址自己拉图，拉不到再下载后上传
         route = (Route("POST", "/v2/groups/{group_openid}/files", group_openid=ctx.target_id)
                  if ctx.target_kind == "group" else
                  Route("POST", "/v2/users/{openid}/files", openid=ctx.target_id))
-        uploaded = await self.api._http.request(route, json={
-            "file_type": 1, "file_data": base64.b64encode(data).decode(), "srv_send_msg": False})
+        try:
+            uploaded = await self.api._http.request(route, json={"file_type": 1, "url": url, "srv_send_msg": False})
+        except Exception as e:
+            log.info("QQ 按网址拉图失败（%s），改为下载后上传", e)
+            async with self.http_session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as r:
+                data = await r.read()
+            uploaded = await self.api._http.request(route, json={
+                "file_type": 1, "file_data": base64.b64encode(data).decode(), "srv_send_msg": False})
         state = self.last_msg[ctx.target_id]
         state[2] += 1
         await send(msg_type=7, content=" ", media={"file_info": uploaded["file_info"]}, msg_seq=state[2])

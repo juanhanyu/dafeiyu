@@ -19,7 +19,6 @@ class Config:
     bot_name: str = os.getenv("BOT_NAME", "Atrei")
     persona: str = os.getenv("BOT_PERSONA", "")
     owner_id: str = os.getenv("OWNER_ID", "")
-    sticker_dir: Path = ROOT / "stickers"
     tz: ZoneInfo = ZoneInfo(os.getenv("TIMEZONE", "Asia/Shanghai"))
     history_turns: int = int(os.getenv("HISTORY_TURNS", "10"))
 

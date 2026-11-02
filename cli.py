@@ -35,7 +35,7 @@ async def main():
         reply = await brain.handle(ctx, line, images)
         print(f"{cfg.bot_name} > {reply}")
         for path in ctx.stickers:
-            print(f"{cfg.bot_name} > [表情包 {path.stem}]")
+            print(f"{cfg.bot_name} > [表情包：{path['desc'][:40]}]")
         print()
 
 
