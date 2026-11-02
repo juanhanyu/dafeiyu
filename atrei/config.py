@@ -36,6 +36,9 @@ class Config:
     breeze_api_key: str = os.getenv("BREEZE_API_KEY", "")
     voice_id: str = os.getenv("VOICE_ID", "voc_8yud7hz7c9q2")
 
+    # 联网搜索（Tavily）：没填就不搜
+    tavily_api_key: str = os.getenv("TAVILY_API_KEY", "")
+
     # 生图：Codex 登录信息存在这个 HF 私有数据集里（续期后写回去）
     hf_token: str = os.getenv("HF_TOKEN", "")
     hf_repo: str = os.getenv("HF_BACKUP_REPO", "")

@@ -15,12 +15,13 @@ from .config import Config
 from .faces import FACES, TOKEN as FACE_TOKEN
 from .voice import ASK_FOR_SONG, Voice
 from .imagegen import ImageGen
+from .search import SEARCH_TOOL, WebSearch
 from .memory import MemoryStore
 from .tools import IMAGE_TOOL, WEEKDAYS, Context, StickerLibrary, ToolBox, tool_schemas
 
 log = logging.getLogger("atrei")
 
-MAX_TOOL_ROUNDS = 3
+MAX_TOOL_ROUNDS = 4  # 查资料 → 回答 → 配表情包，最多来回几次
 FACE_CHANCE = 0.4  # 大约四成消息带一个 QQ 小黄脸
 
 HELP = "咕噜~ 本鱼就是陪你聊天的，想说啥直接说，发图片也行~\n/清空 可以让鱼鱼忘掉刚才聊的"
@@ -61,7 +62,7 @@ SYSTEM = """你是「{name}」：拟人化的 DeepSeek 鲸鱼娘，深蓝长发�
 OWNER_ONLY_FACTS = (
     "（只告诉主人的幕后资料：你的脑子是 DeepSeek V4.1 Flash，开着最高档思考；你住在 Render 免费版的新加坡服务器上，"
     "代码在主人的 GitHub 仓库 juanhanyu/dafeiyu；表情包来自 dsh-nekowhale-stickers 和 dsh-meme 两个大肥鱼表情库；"
-    "声音是 BreezeBlue 的「大肥鱼（迷糊版）」；画画是借 Codex 找 GPT 姐姐画的，每天最多 10 张；"
+    "声音是 BreezeBlue 的「大肥鱼（迷糊版）」；画画是借 Codex 找 GPT 姐姐画的，每天最多 12 张；"
     "聊天记忆存在主人 Hugging Face 的私有数据集里，重启也不会忘。各种密钥你从来看不到，也不知道。）"
 )
 
@@ -73,13 +74,14 @@ class Brain:
         self.tools = ToolBox(self.stickers)
         self.tool_schemas = tool_schemas(self.stickers.emotions)
         self.voice = Voice(cfg.breeze_api_key, cfg.voice_id)
+        self.search = WebSearch(cfg.tavily_api_key)
         self.memory = MemoryStore(cfg.hf_token, cfg.hf_repo)
         # 要长期保留的小设置：认过的主人编号、自我介绍过的群、当天画了几张（随对话一起存档）
         self.meta: dict = {}
         self.imagegen = ImageGen(cfg.hf_token, cfg.hf_repo, cfg.tz, self.meta, self.memory)
         self.bind_code: tuple[str, float] | None = None  # /认主 的临时口令和过期时间
         self.bind_tries = 0
-        self._secrets = [v for v in (cfg.llm_api_key, cfg.breeze_api_key, cfg.hf_token, cfg.qq_secret) if v and len(v) >= 8]
+        self._secrets = [v for v in (cfg.llm_api_key, cfg.breeze_api_key, cfg.hf_token, cfg.qq_secret, cfg.tavily_api_key) if v and len(v) >= 8]
         self.client = AsyncOpenAI(base_url=cfg.llm_base_url, api_key=cfg.llm_api_key or "missing")
         self.histories: dict[str, list[dict]] = defaultdict(list)
         self.locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -230,6 +232,8 @@ class Brain:
                 tools.append(IMAGE_TOOL)
             messages[0]["content"] += ("\n- 对方可能想看图：要是想要一张新画的图（比如你在干什么的样子、某个场景），就用 generate_image 画；只是要表情包就别画。别提还能画几张。" if left > 0
                                        else "\n- 对方想让你画画，但今天画不了了：要说「本鱼今天已经没脸找GPT姐姐画画啦~」，可以再撒个娇。")
+        if self.search.enabled:  # 搜索工具一直给，但描述里写明一般不用，只在不懂又关键时才查
+            tools.append(SEARCH_TOOL)
         tool_args = {"tools": tools} if tools else {}
 
         reply = ""
@@ -260,16 +264,21 @@ class Brain:
                 ],
             }
             messages.append(assistant)
+            searched = False
             for call in msg.tool_calls:
                 try:
                     args = json.loads(call.function.arguments or "{}")
                 except json.JSONDecodeError:
                     args = {}
-                result = self.tools.run(ctx, call.function.name, args)
+                if call.function.name == "web_search":
+                    searched = True
+                    result = json.dumps(await self.search.search(args.get("query", "")), ensure_ascii=False)
+                else:
+                    result = self.tools.run(ctx, call.function.name, args)
                 log.info("tool %s(%s) -> %s", call.function.name, args, result[:200])
                 tool_msg = {"role": "tool", "tool_call_id": call.id, "content": result}
                 messages.append(tool_msg)
-            if said:  # 话已经说完、只是顺手发了表情包，就不再让模型多说一遍
+            if said and not searched:  # 话已经说完、只是顺手发了表情包，就不再让模型多说一遍（查了资料就要接着回答）
                 reply = "\n".join(said)
                 break
         else:
