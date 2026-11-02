@@ -1,7 +1,7 @@
 """生图：借用一个专门给鱼鱼登录的 Codex（ChatGPT 订阅）账号，调用 Codex 的生图接口。
 
 做法参考 https://github.com/jdmnk/codex-imagegen-cli 。用的是 OpenAI 没公开的接口，随时可能失效，
-账号也有被风控的风险，所以只让主人用、每天限量。
+账号也有被风控的风险，所以每天限量（所有人共用）。
 
 Codex 的续期令牌每用一次就换新的，而 Render 免费版重启会清空硬盘，所以登录信息（auth.json）
 存在 Hugging Face 私有数据集里：启动时读出来，续期后写回去。
@@ -46,8 +46,8 @@ class ImageGen:
         return self.auth is not None
 
     def offered(self, user_id: str, text: str) -> bool:
-        """只有主人提到画图时，才把生图工具交给模型。"""
-        return self.enabled and user_id == self.owner_id and bool(ASK_FOR_IMAGE.search(text or ""))
+        """有人提到画图时，才把生图工具交给模型（所有人都能用，全天共用一个上限）。"""
+        return self.enabled and bool(ASK_FOR_IMAGE.search(text or ""))
 
     def quota_left(self) -> int:
         if self.day != date.today():

@@ -151,7 +151,9 @@ class AtreiClient(botpy.Client):
             await send(msg_type=7, content=" ", media={"file_info": uploaded["file_info"]}, msg_seq=state[2])
         except Exception as e:
             log.warning("画图失败：%s", e)
-            await self._send_passive(ctx.target_id, send, "呜…鱼鱼这次没画出来，等会儿再试试嘛")
+            text = ("本鱼今天已经没脸找GPT姐姐画画啦~" if "用完" in str(e)
+                    else "呜…鱼鱼这次没画出来，等会儿再试试嘛")
+            await self._send_passive(ctx.target_id, send, text)
 
     async def _send_voice(self, ctx: Context, message, send, text: str) -> bool:
         """把回复念成语音发出去；失败就返回 False，改发文字。"""
