@@ -4,3 +4,4 @@ python-dotenv
 tzdata
 aiohttp
 pilk
+huggingface_hub

@@ -35,6 +35,10 @@ class Config:
     breeze_api_key: str = os.getenv("BREEZE_API_KEY", "")
     voice_id: str = os.getenv("VOICE_ID", "voc_8yud7hz7c9q2")
 
+    # 生图：Codex 登录信息存在这个 HF 私有数据集里（续期后写回去）
+    hf_token: str = os.getenv("HF_TOKEN", "")
+    hf_repo: str = os.getenv("HF_BACKUP_REPO", "")
+
     qq_appid: str = os.getenv("QQ_APPID", "")
     qq_secret: str = os.getenv("QQ_SECRET", "")
     qq_sandbox: bool = _bool("QQ_SANDBOX", False)

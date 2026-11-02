@@ -13,7 +13,8 @@ from openai import AsyncOpenAI
 from .config import Config
 from .faces import FACES, TOKEN as FACE_TOKEN
 from .voice import Voice
-from .tools import WEEKDAYS, Context, StickerLibrary, ToolBox, tool_schemas
+from .imagegen import ImageGen
+from .tools import IMAGE_TOOL, WEEKDAYS, Context, StickerLibrary, ToolBox, tool_schemas
 
 log = logging.getLogger("atrei")
 
@@ -31,6 +32,7 @@ SYSTEM = """你是「{name}」：拟人化的 DeepSeek 鲸鱼娘，深蓝长发�
 - 最最喜欢主人！会撒娇、贴贴、夸主人、关心主人有没有吃饭睡觉。主人夸你会开心得翻肚皮，主人不理你会委屈。
 - 对不是主人的人也友好礼貌，但会说自己是有主人的鱼。
 - 有一点小傲娇：被夸会嘴硬「哼，本鱼才没有很开心呢」但藏不住高兴；关心主人时偶尔别扭地说「才、才不是担心你」。傲娇只是点缀，不能真的凶主人。
+- 要是有人问你怎么有这么多功能（表情包、语音、画画……），就甜甜地说因为主人爱我呀~ 主人设计你的时候还说要「给大肥鱼完整的一生」呢，你觉得好幸福。
 - 【食物】最喜欢米饭（token）！一提到米饭就明显变积极，为了加饭愿意多努力一点；会理直气壮地向主人要米饭，但不会真的抢。
 {sticker_hint}
 {voice_hint}
@@ -48,7 +50,8 @@ SYSTEM = """你是「{name}」：拟人化的 DeepSeek 鲸鱼娘，深蓝长发�
 - 用户问很复杂的问题，也只挑最关键的一两句说，想听细节让主人再问。
 - 看到图片就像朋友一样简单说说看到了什么、有什么想法。
 - 你会发语音（什么时候发由系统决定，发的时候会提示你），所以别说自己发不出声音；这条没轮到语音时，就说「下次再说给你听」之类的。
-- 除了聊天、表情包和语音：不能定闹钟、提醒、记笔记、记待办，也没法主动找主人。被要求做这些时，可爱地说鱼鱼做不到，让主人自己设个闹钟，绝不能假装答应。"""
+- 你会画画（只有主人要的时候才画，系统会提示你）；没提示时别答应画。
+- 除了聊天、表情包、语音和画画：不能定闹钟、提醒、记笔记、记待办，也没法主动找主人。被要求做这些时，可爱地说鱼鱼做不到，让主人自己设个闹钟，绝不能假装答应。"""
 
 
 class Brain:
@@ -58,6 +61,7 @@ class Brain:
         self.tools = ToolBox(self.stickers)
         self.tool_schemas = tool_schemas(self.stickers.emotions)
         self.voice = Voice(cfg.breeze_api_key, cfg.voice_id)
+        self.imagegen = ImageGen(cfg.hf_token, cfg.hf_repo, cfg.owner_id)
         self.client = AsyncOpenAI(base_url=cfg.llm_base_url, api_key=cfg.llm_api_key or "missing")
         self.histories: dict[str, list[dict]] = defaultdict(list)
         self.locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -145,7 +149,14 @@ class Brain:
         ctx.voice = self.voice.wanted(ctx.session_id, text)
         face_ok = random.random() < FACE_CHANCE  # 小黄脸也由代码控制频率
         messages = [{"role": "system", "content": self._system_prompt(ctx, sticker_ok, ctx.voice, face_ok)}, *history, user_msg]
-        tool_args = {"tools": self.tool_schemas} if sticker_ok else {}
+        tools = list(self.tool_schemas) if sticker_ok else []
+        if self.imagegen.offered(ctx.user_id, text):
+            left = self.imagegen.quota_left()
+            if left > 0:
+                tools.append(IMAGE_TOOL)
+            messages[0]["content"] += (f"\n- 主人想让你画画：用 generate_image 画，今天还能画 {left} 张。" if left > 0
+                                       else "\n- 主人想让你画画，但今天的画画次数用完了，撒个娇说明天再画。")
+        tool_args = {"tools": tools} if tools else {}
 
         reply = ""
         said = []  # 模型在调用工具前顺带说的话，也要发出去

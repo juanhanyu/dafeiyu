@@ -24,6 +24,7 @@ class Context:
     is_group: bool = False
     stickers: list[dict] = field(default_factory=list)  # 本轮要发的表情包（stickers.json 里的条目）
     voice: bool = False  # 本轮回复要念成语音发
+    drawings: list[str] = field(default_factory=list)  # 本轮要画的图（画面描述）
 
 
 class StickerLibrary:
@@ -67,6 +68,20 @@ class StickerLibrary:
         return choice
 
 
+IMAGE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "generate_image",
+        "description": "给主人画一张图（会在你的文字后面发出去，要等一会儿）。一次回复最多画一张。",
+        "parameters": {
+            "type": "object",
+            "properties": {"prompt": {"type": "string", "description": "详细的画面描述：主体、动作、场景、风格、构图、光线"}},
+            "required": ["prompt"],
+        },
+    },
+}
+
+
 def tool_schemas(emotions: list[str]) -> list[dict]:
     return [{
         "type": "function",
@@ -98,6 +113,12 @@ class ToolBox:
         except Exception as e:  # 把错误交给模型，让它自己纠正
             result = {"error": f"{type(e).__name__}: {e}"}
         return json.dumps(result, ensure_ascii=False, default=str)
+
+    def t_generate_image(self, ctx, prompt):
+        if ctx.drawings:
+            return {"error": "这次已经画了一张了"}
+        ctx.drawings.append(prompt)
+        return {"ok": True, "note": "已开始画，图会在你的文字后面发出去。跟主人说一句马上画好之类的话就行，不要描述画面细节。"}
 
     def t_send_sticker(self, ctx, emotion, keywords=""):
         if ctx.stickers:

@@ -71,6 +71,7 @@ class AtreiClient(botpy.Client):
         log.info("「%s」上线了", self.robot.name)
         if self.http_session is None:  # 断线重连也会触发 on_ready，只初始化一次
             self.http_session = aiohttp.ClientSession()
+            await self.brain.imagegen.load()
 
     # ---------- 收消息 ----------
     async def on_group_at_message_create(self, message: GroupMessage):
@@ -117,6 +118,8 @@ class AtreiClient(botpy.Client):
                 log.info("发了表情包 %s", sticker["id"])
             except Exception as e:
                 log.warning("表情包 %s 发送失败：%s", sticker["id"], e)
+        for prompt in ctx.drawings:
+            await self._send_drawing(ctx, message, send, prompt)
 
     async def _send_text(self, ctx: Context, send, text: str):
         """带 [可爱] 这类 QQ 表情的回复用 Markdown 发（黄脸是行内小图），失败或频道里就去掉表情发文字。"""
@@ -129,6 +132,26 @@ class AtreiClient(botpy.Client):
             except Exception as e:
                 log.warning("Markdown 表情发送失败，改发文字：%s", e)
         await self._send_passive(ctx.target_id, send, faces.TOKEN.sub("", text).strip() or "……")
+
+    async def _send_drawing(self, ctx: Context, message, send, prompt: str):
+        """调 Codex 生图，再像表情包一样上传发出去；失败就说一声。"""
+        try:
+            png = await self.brain.imagegen.generate(prompt)
+            log.info("画好了：%s", prompt[:60])
+            if ctx.target_kind in ("guild", "dm"):
+                await message.reply(file_image=png)
+                return
+            route = (Route("POST", "/v2/groups/{group_openid}/files", group_openid=ctx.target_id)
+                     if ctx.target_kind == "group" else
+                     Route("POST", "/v2/users/{openid}/files", openid=ctx.target_id))
+            uploaded = await self.api._http.request(route, json={
+                "file_type": 1, "file_data": base64.b64encode(png).decode(), "srv_send_msg": False})
+            state = self.last_msg[ctx.target_id]
+            state[2] += 1
+            await send(msg_type=7, content=" ", media={"file_info": uploaded["file_info"]}, msg_seq=state[2])
+        except Exception as e:
+            log.warning("画图失败：%s", e)
+            await self._send_passive(ctx.target_id, send, "呜…鱼鱼这次没画出来，等会儿再试试嘛")
 
     async def _send_voice(self, ctx: Context, message, send, text: str) -> bool:
         """把回复念成语音发出去；失败就返回 False，改发文字。"""
