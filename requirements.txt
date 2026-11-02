@@ -3,4 +3,4 @@ openai>=1.40
 python-dotenv
 tzdata
 aiohttp
-pillow
+pilk

@@ -112,8 +112,9 @@ class AtreiClient(botpy.Client):
             return
 
         reply = await self.brain.handle(ctx, text, images)
-        for chunk in split_text(reply):
-            await self._send_passive(ctx.target_id, send, chunk)
+        if not (ctx.voice and await self._send_voice(ctx, message, send, reply)):
+            for chunk in split_text(reply):
+                await self._send_passive(ctx.target_id, send, chunk)
         for sticker in ctx.stickers:
             try:
                 await self._send_sticker(ctx, message, send, sticker)
@@ -139,6 +140,26 @@ class AtreiClient(botpy.Client):
                 state[2] += 1
                 await send(content=f"{label} 发送失败：{str(e)[:80]}", msg_seq=state[2])
         log.info("表情测试已发出 %s", [v[0] for v in variants])
+
+    async def _send_voice(self, ctx: Context, message, send, text: str) -> bool:
+        """把回复念成语音发出去；失败就返回 False，改发文字。"""
+        if ctx.target_kind not in ("group", "c2c"):
+            return False
+        try:
+            silk = await self.brain.voice.synthesize(text)
+            route = (Route("POST", "/v2/groups/{group_openid}/files", group_openid=ctx.target_id)
+                     if ctx.target_kind == "group" else
+                     Route("POST", "/v2/users/{openid}/files", openid=ctx.target_id))
+            uploaded = await self.api._http.request(route, json={
+                "file_type": 3, "file_data": base64.b64encode(silk).decode(), "srv_send_msg": False})
+            state = self.last_msg[ctx.target_id]
+            state[2] += 1
+            await send(msg_type=7, content=" ", media={"file_info": uploaded["file_info"]}, msg_seq=state[2])
+            log.info("发了语音：%s", text[:40])
+            return True
+        except Exception as e:
+            log.warning("语音发送失败，改发文字：%s", e)
+            return False
 
     async def _send_sticker(self, ctx: Context, message, send, sticker: dict):
         url = sticker["url"]

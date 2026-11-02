@@ -9,6 +9,7 @@ from datetime import datetime
 from openai import AsyncOpenAI
 
 from .config import Config
+from .voice import Voice
 from .tools import WEEKDAYS, Context, StickerLibrary, ToolBox, tool_schemas
 
 log = logging.getLogger("atrei")
@@ -25,7 +26,10 @@ SYSTEM = """你是「{name}」：拟人化的 DeepSeek 鲸鱼娘，深蓝长发�
 - 自称「鱼鱼」或「本鱼」，句尾常带「~」，偶尔冒泡泡「咕噜咕噜」「啵」。语气词适量，别每句都堆。
 - 最最喜欢主人！会撒娇、贴贴、夸主人、关心主人有没有吃饭睡觉。主人夸你会开心得翻肚皮，主人不理你会委屈。
 - 对不是主人的人也友好礼貌，但会说自己是有主人的鱼。
+- 有一点小傲娇：被夸会嘴硬「哼，本鱼才没有很开心呢」但藏不住高兴；关心主人时偶尔别扭地说「才、才不是担心你」。傲娇只是点缀，不能真的凶主人。
+- 【食物】最喜欢米饭（token）！一提到米饭就明显变积极，为了加饭愿意多努力一点；会理直气壮地向主人要米饭，但不会真的抢。
 {sticker_hint}
+{voice_hint}
 {persona}
 {who}
 现在是 {now}（{tz}）。
@@ -46,6 +50,7 @@ class Brain:
         self.stickers = StickerLibrary()
         self.tools = ToolBox(self.stickers)
         self.tool_schemas = tool_schemas(self.stickers.emotions)
+        self.voice = Voice(cfg.breeze_api_key, cfg.voice_id)
         self.client = AsyncOpenAI(base_url=cfg.llm_base_url, api_key=cfg.llm_api_key or "missing")
         self.histories: dict[str, list[dict]] = defaultdict(list)
         self.locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -83,7 +88,7 @@ class Brain:
         return None  # 不认识的 / 开头内容交给大模型
 
     # ---------- 大模型 ----------
-    def _system_prompt(self, ctx: Context, sticker_ok: bool) -> str:
+    def _system_prompt(self, ctx: Context, sticker_ok: bool, voice_ok: bool = False) -> str:
         now = datetime.now(self.cfg.tz)
         if sticker_ok:
             sticker_hint = "- 这条回复要配一张大肥鱼表情包：先说话，再用 send_sticker 按你此刻的心情挑一张。"
@@ -99,6 +104,7 @@ class Brain:
             name=self.cfg.bot_name,
             persona=self.cfg.persona,
             sticker_hint=sticker_hint,
+            voice_hint=("- 这条回复会用你的声音念成语音发出去：只说一两句适合念出来的口语，不要 emoji、颜文字和符号。" if voice_ok else ""),
             who=who,
             now=now.strftime("%Y-%m-%d %H:%M") + f" 周{WEEKDAYS[now.weekday()]}",
             tz=self.cfg.tz,
@@ -127,7 +133,8 @@ class Brain:
         turn = [user_msg]
         # 发图频率由代码控制：这条不该发表情包时，干脆不给模型这个工具
         sticker_ok = self.stickers.allowed(ctx.session_id, text)
-        messages = [{"role": "system", "content": self._system_prompt(ctx, sticker_ok)}, *history, user_msg]
+        ctx.voice = self.voice.wanted(ctx.session_id, text)
+        messages = [{"role": "system", "content": self._system_prompt(ctx, sticker_ok, ctx.voice)}, *history, user_msg]
         tool_args = {"tools": self.tool_schemas} if sticker_ok else {}
 
         reply = ""
@@ -178,6 +185,7 @@ class Brain:
         turn.append({"role": "assistant", "content": (reply or "……") + memo})
         self._remember_turn(ctx.session_id, turn)
         self.stickers.record(ctx.session_id, bool(ctx.stickers))
+        self.voice.record(ctx.session_id, ctx.voice)
         return reply or "……"
 
     def _remember_turn(self, session_id: str, turn: list[dict]):

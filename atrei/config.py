@@ -31,6 +31,10 @@ class Config:
     # 思考等级（DeepSeek：low / high / max）；留空则不传，换别家模型时用
     llm_reasoning_effort: str = os.getenv("LLM_REASONING_EFFORT", "max")
 
+    # 语音（BreezeBlue）：没填 Key 就不发语音；默认大肥鱼（迷糊版）
+    breeze_api_key: str = os.getenv("BREEZE_API_KEY", "")
+    voice_id: str = os.getenv("VOICE_ID", "voc_8yud7hz7c9q2")
+
     qq_appid: str = os.getenv("QQ_APPID", "")
     qq_secret: str = os.getenv("QQ_SECRET", "")
     qq_sandbox: bool = _bool("QQ_SANDBOX", False)

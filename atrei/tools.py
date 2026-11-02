@@ -23,6 +23,7 @@ class Context:
     target_id: str
     is_group: bool = False
     stickers: list[dict] = field(default_factory=list)  # 本轮要发的表情包（stickers.json 里的条目）
+    voice: bool = False  # 本轮回复要念成语音发
 
 
 class StickerLibrary:
