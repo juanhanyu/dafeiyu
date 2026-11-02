@@ -27,7 +27,10 @@ class Config:
     llm_api_key: str = os.getenv("LLM_API_KEY", "")
     llm_model: str = os.getenv("LLM_MODEL", "claude-sonnet-5-5")
     llm_vision: bool = _bool("LLM_VISION", True)
-    llm_max_tokens: int = int(os.getenv("LLM_MAX_TOKENS", "400"))
+    # 思考也算在 max_tokens 里，开最高思考时要留足；回复长短由人设里的规则控制
+    llm_max_tokens: int = int(os.getenv("LLM_MAX_TOKENS", "8000"))
+    # 思考等级（DeepSeek：low / high / max）；留空则不传，换别家模型时用
+    llm_reasoning_effort: str = os.getenv("LLM_REASONING_EFFORT", "max")
 
     qq_appid: str = os.getenv("QQ_APPID", "")
     qq_secret: str = os.getenv("QQ_SECRET", "")

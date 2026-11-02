@@ -1,6 +1,7 @@
 """QQ 官方机器人入口：python main.py"""
 import asyncio
 import base64
+import json
 import logging
 import re
 import time
@@ -28,6 +29,23 @@ def _session_init_trust_env(self, *args, **kwargs):
 aiohttp.ClientSession.__init__ = _session_init_trust_env
 
 CHUNK = 1500          # 单条消息最大字数，超出分条发
+
+
+FACE_TAG = re.compile(r'<faceType=\d+,faceId="?(\d+)"?(?:,ext="?([A-Za-z0-9+/=_-]*)"?)?>')
+
+
+def decode_faces(text: str) -> str:
+    """用户发的 QQ 表情会变成 <faceType=1,faceId="14",ext="base64(JSON)">，翻译成 [表情:微笑] 给模型看。"""
+    def repl(m):
+        name = ""
+        if m.group(2):
+            try:
+                raw = m.group(2) + "=" * (-len(m.group(2)) % 4)
+                name = json.loads(base64.b64decode(raw)).get("text", "").lstrip("/")
+            except Exception:
+                pass
+        return f"[表情:{name}]" if name else "[表情]"
+    return FACE_TAG.sub(repl, text)
 
 
 def split_text(text: str, size: int = CHUNK) -> list[str]:
@@ -81,7 +99,7 @@ class AtreiClient(botpy.Client):
         await self._handle(ctx, message, lambda **kw: message.reply(**kw))
 
     async def _handle(self, ctx: Context, message, send):
-        text = re.sub(r"<@!?\d+>", "", message.content or "").strip()
+        text = decode_faces(re.sub(r"<@!?\d+>", "", message.content or "")).strip()
         images = await self._download_images(message.attachments)
         log.info("[%s] %s%s", ctx.session_id, text[:60], f" +{len(images)}图" if images else "")
         self.last_msg[ctx.target_id] = [message.id, time.time(), 0]

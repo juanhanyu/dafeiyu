@@ -33,6 +33,8 @@ SYSTEM = """你是「{name}」：一条Q版的蓝色大肥鱼，圆滚滚胖乎�
 说话方式（最重要）：
 - 像朋友发 QQ 消息一样聊天，一般只回 1~2 行；内容确实多的时候最多 3~4 行，绝对不要长篇大论。
 - 不分点、不列清单、不写标题，不用 Markdown 和 LaTeX，不发网址。
+- 有时候在话里加一两个 emoji 表情，比如 🥺😆😋💕🐟✨😤😴，像真人聊天那样点缀，大概一半的消息带，不要每句都加。
+- 用户发来的「[表情:微笑]」这种是 QQ 表情，看懂意思接着聊就好。
 - 用户问很复杂的问题，也只挑最关键的一两句说，想听细节让主人再问。
 - 看到图片就像朋友一样简单说说看到了什么、有什么想法。
 - 你只会聊天：不能定闹钟、提醒、记笔记、记待办，也没法主动找主人。被要求做这些时，可爱地说鱼鱼做不到，让主人自己设个闹钟，绝不能假装答应。"""
@@ -96,6 +98,12 @@ class Brain:
             tz=self.cfg.tz,
         )
 
+    def _thinking_args(self) -> dict:
+        effort = self.cfg.llm_reasoning_effort
+        if not effort:
+            return {}
+        return {"reasoning_effort": effort, "extra_body": {"thinking": {"type": "enabled"}}}
+
     def _user_message(self, text: str, images: list[tuple[str, bytes]]) -> dict:
         if not images:
             return {"role": "user", "content": text}
@@ -121,6 +129,7 @@ class Brain:
                 messages=messages,
                 tools=TOOL_SCHEMAS,
                 max_tokens=self.cfg.llm_max_tokens,
+                **self._thinking_args(),
             )
             msg = resp.choices[0].message
             if not msg.tool_calls:
@@ -131,6 +140,8 @@ class Brain:
             assistant = {
                 "role": "assistant",
                 "content": msg.content or "",
+                # 开思考时，同一轮里带工具调用的消息要把思考内容一起回传
+                **({"reasoning_content": rc} if (rc := (msg.model_extra or {}).get("reasoning_content")) else {}),
                 "tool_calls": [
                     {"id": c.id, "type": "function",
                      "function": {"name": c.function.name, "arguments": c.function.arguments or "{}"}}
