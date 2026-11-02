@@ -76,7 +76,8 @@ IMAGE_TOOL = {
         "description": "给主人画一张图（会在你的文字后面发出去，要等一会儿）。一次回复最多画一张。",
         "parameters": {
             "type": "object",
-            "properties": {"prompt": {"type": "string", "description": "详细的画面描述：主体、动作、场景、风格、构图、光线"}},
+            "properties": {"prompt": {"type": "string", "description": "详细的画面描述：主体、动作、场景、风格、构图、光线。"
+                                      "画你自己时写清楚长相：Q版拟人鲸鱼娘，深蓝长发、头顶一根呆毛、女仆头饰、蓝眼睛"}},
             "required": ["prompt"],
         },
     },

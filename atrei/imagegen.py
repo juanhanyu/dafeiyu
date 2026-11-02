@@ -27,7 +27,8 @@ ORIGINATOR = "codex_cli_rs"
 CODEX_VERSION = os.getenv("CODEX_VERSION", "0.80.0")
 AUTH_FILE = "codex_auth.json"               # 在 HF 数据集里的文件名
 DAILY_LIMIT = int(os.getenv("IMAGE_DAILY_LIMIT", "10"))
-ASK_FOR_IMAGE = re.compile(r"画|生图|生成.{0,4}图|做.{0,2}张图|来张图|出图")
+# 提到图/画/照片就把画画工具交给模型，由它判断是要画新图还是发表情包
+ASK_FOR_IMAGE = re.compile(r"画|图|照片|相片|自拍|生成|P一张|p一张")
 
 
 class ImageGen:
