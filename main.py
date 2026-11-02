@@ -122,23 +122,22 @@ class AtreiClient(botpy.Client):
                 log.warning("表情包 %s 发送失败：%s", sticker["id"], e)
 
     async def _face_test(self, ctx: Context, raw: str, send):
-        """实验：用几种写法发「微笑」，看 QQ 里哪种能显示成真正的 QQ 表情。"""
-        def ext(name):
-            return base64.b64encode(json.dumps({"text": name}, ensure_ascii=False).encode()).decode()
+        """实验第二轮：普通文字发不了 QQ 表情，试 Markdown 消息（msg_type=2），把黄脸图片当行内小图嵌进去。"""
+        face = "https://koishi.js.org/QFace/assets/qq_emoji/14"
         variants = [
-            ("A", f'<faceType=1,faceId="14",ext="{ext("[微笑]")}">'),
-            ("B", f'<faceType=1,faceId="14",ext="{ext("/微笑")}">'),
-            ("C", '<faceType=1,faceId="14">'),
-            ("D", "<emoji:14>"),
+            ("F", f"鱼鱼笑一个 ![微笑 #24px #24px]({face}/png/14.png) 这是F"),
+            ("G", f"动起来的 ![微笑 #24px #24px]({face}/apng/14.png) 这是G"),
+            ("H", "Markdown 里的 <emoji:14> 这是H"),
         ]
-        echoed = FACE_TAG.search(raw)
-        if echoed:  # 把用户发来的表情原样发回去
-            variants.append(("E", echoed.group(0)))
-        for label, face in variants:
+        state = self.last_msg[ctx.target_id]
+        for label, content in variants:
+            state[2] += 1
             try:
-                await self._send_passive(ctx.target_id, send, f"{label}：{face} 这是{label}")
+                await send(msg_type=2, markdown={"content": content}, msg_seq=state[2])
             except Exception as e:
                 log.warning("表情测试 %s 失败：%s", label, e)
+                state[2] += 1
+                await send(content=f"{label} 发送失败：{str(e)[:80]}", msg_seq=state[2])
         log.info("表情测试已发出 %s", [v[0] for v in variants])
 
     async def _send_sticker(self, ctx: Context, message, send, sticker: dict):
