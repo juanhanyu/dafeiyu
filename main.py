@@ -59,14 +59,15 @@ class AtreiClient(botpy.Client):
         uid = message.author.member_openid
         ctx = Context(user_id=uid, session_id=f"g:{message.group_openid}:{uid}",
                       target_kind="group", target_id=message.group_openid, is_group=True)
+        # msg_type 默认 0（文字），发表情包时传 7（富媒体）覆盖
         await self._handle(ctx, message, lambda **kw: self.api.post_group_message(
-            group_openid=message.group_openid, msg_type=0, msg_id=message.id, **kw))
+            group_openid=message.group_openid, msg_id=message.id, **{"msg_type": 0, **kw}))
 
     async def on_c2c_message_create(self, message: C2CMessage):
         uid = message.author.user_openid
         ctx = Context(user_id=uid, session_id=f"u:{uid}", target_kind="c2c", target_id=uid)
         await self._handle(ctx, message, lambda **kw: self.api.post_c2c_message(
-            openid=uid, msg_type=0, msg_id=message.id, **kw))
+            openid=uid, msg_id=message.id, **{"msg_type": 0, **kw}))
 
     async def on_at_message_create(self, message: Message):  # QQ 频道里 @ 机器人
         uid = message.author.id
