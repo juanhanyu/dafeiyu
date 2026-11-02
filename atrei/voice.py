@@ -13,7 +13,7 @@ from pathlib import Path
 import aiohttp
 
 API = "https://api.breeze.blue/v1/text-to-speech/{voice_id}?output_format=mp3"
-ASK_FOR_VOICE = re.compile(r"语音|说给我听|念给我听|听听你的声音|听你说|你的声音|讲给我听")
+ASK_FOR_VOICE = re.compile(r"语音|语言听|发个语言|声音|说给我听|念给我听|讲给我听|听你说|说句话|听听|开口|用嘴说")
 COOLDOWN_REPLIES = 15     # 自动发过一条语音后，至少隔这么多条回复才会再自动发
 CHANCE = 0.05             # 冷却结束后，每条回复自动发语音的概率
 MAX_CHARS = 120           # 太长的话不念，免得费积分
