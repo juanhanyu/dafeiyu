@@ -45,7 +45,8 @@ class Voice:
         clean = re.sub(r"\[[^\[\]]{1,4}\]", "", EMOJI.sub("", text)).replace("~", "。").strip()[:MAX_CHARS]
         async with aiohttp.ClientSession() as s:
             async with s.post(API.format(voice_id=self.voice_id), json={"text": clean},
-                              headers={"xi-api-key": self.api_key},
+                              # 不带自定义 User-Agent 会被 Cloudflare 当成爬虫拦下（error 1010）
+                              headers={"xi-api-key": self.api_key, "user-agent": "dafeiyu-qq-bot/1.0"},
                               timeout=aiohttp.ClientTimeout(total=60)) as r:
                 if r.status != 200:
                     raise RuntimeError(f"语音合成失败 {r.status}: {(await r.text())[:200]}")
