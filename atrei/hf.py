@@ -1,7 +1,7 @@
-"""Hugging Face Spaces 托管支持：占位网页、自我保活、数据库备份到私有数据集。
+"""免费托管支持（Render / Hugging Face Spaces）：占位网页、自我保活、数据库备份到 HF 私有数据集。
 
-Space 的硬盘重启就清空，所以把 SQLite 定时备份到 HF_BACKUP_REPO（私有 dataset），启动时再拉回来。
-不在 Space 上运行（没有 SPACE_HOST / HF_TOKEN）时，这里的功能都会自动跳过。
+这类平台的硬盘重启就清空，所以把 SQLite 定时备份到 HF_BACKUP_REPO（私有 dataset），启动时再拉回来。
+在自己电脑上运行（没有 RENDER_EXTERNAL_URL / SPACE_HOST / HF_TOKEN）时，这里的功能都会自动跳过。
 """
 import asyncio
 import hashlib
@@ -19,10 +19,13 @@ log = logging.getLogger("atrei")
 
 PORT = int(os.getenv("PORT", "7860"))
 SPACE_HOST = os.getenv("SPACE_HOST", "")          # HF 自动注入，如 user-dafeiyu.hf.space
+RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "")  # Render 自动注入，如 https://dafeiyu.onrender.com
+SELF_URL = RENDER_URL or (f"https://{SPACE_HOST}" if SPACE_HOST else "")
+HOSTED = bool(SELF_URL)
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 BACKUP_REPO = os.getenv("HF_BACKUP_REPO", "")      # 如 user/dafeiyu-data
 BACKUP_NAME = "atrei.db"
-PING_EVERY = 20 * 60
+PING_EVERY = 10 * 60  # Render 免费版 15 分钟没访问就休眠
 BACKUP_EVERY = 5 * 60
 
 
@@ -81,10 +84,11 @@ async def backup_loop(storage):
 
 async def keepalive_loop():
     """定时访问自己的公开网址，防止免费 Space 闲置休眠。"""
-    if not SPACE_HOST:
+    if not SELF_URL:
         return
-    url = f"https://{SPACE_HOST}/"
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}  # 私有 Space 要带令牌
+    url = SELF_URL.rstrip("/") + "/"
+    # 私有 HF Space 要带令牌；Render 是公开网址，不能把令牌发出去
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"} if SPACE_HOST and HF_TOKEN else {}
     async with aiohttp.ClientSession(headers=headers) as session:
         while True:
             await asyncio.sleep(PING_EVERY)

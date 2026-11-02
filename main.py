@@ -188,7 +188,7 @@ async def main():
     scheduler = Scheduler(storage, cfg.tz)
     intents = botpy.Intents(public_messages=True, public_guild_messages=True, direct_message=True)
     client = AtreiClient(cfg, brain, scheduler, intents=intents, is_sandbox=cfg.qq_sandbox)
-    if hf.SPACE_HOST:  # 在 Hugging Face Space 上：开网页、保活、定时备份
+    if hf.HOSTED:  # 在 Render / HF Space 上：开网页、保活、定时备份
         await hf.start_web(cfg.bot_name, lambda: client.http_session is not None)
         background = [asyncio.create_task(hf.keepalive_loop()), asyncio.create_task(hf.backup_loop(storage))]
     async with client:
