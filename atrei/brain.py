@@ -118,6 +118,9 @@ class Brain:
             who = "现在跟你说话的不是主人，是别人。"
         else:
             who = ""
+        if ctx.is_group:
+            who += ("这是在群里，大家都能看到。跟群友聊天时就正常跟对方聊，别句句提主人、别老说自己是主人的鱼，"
+                    "称呼对方「你」就好；只有话题真的扯到主人、或者对方问起时才提。")
         return SYSTEM.format(
             name=self.cfg.bot_name,
             persona=self.cfg.persona,
