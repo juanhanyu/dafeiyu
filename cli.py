@@ -1,5 +1,5 @@
 """本地终端里跟机器人聊天（不需要 QQ）：python cli.py
-发图片：/图 C:\\path\\to\\题目.png 这道题怎么做
+发图片：/图 C:\\path\\to\\图片.png 你看这个
 """
 import asyncio
 import mimetypes
@@ -8,26 +8,15 @@ from pathlib import Path
 
 from atrei import config
 from atrei.brain import Brain
-from atrei.scheduler import Scheduler
-from atrei.storage import Storage
 from atrei.tools import Context
 
 
 async def main():
     cfg = config.load()
-    storage = Storage(cfg.db_path)
-    brain = Brain(cfg, storage)
-    scheduler = Scheduler(storage, cfg.tz, interval=5)
-
-    async def push(target_id, user_id, text):
-        print(f"\n{cfg.bot_name} > {text}\n你 > ", end="", flush=True)
-        return True
-
-    scheduler.register("cli", push)
-    asyncio.create_task(scheduler.run_forever())
-
-    ctx = Context(user_id="local", session_id="local", target_kind="cli", target_id="local")
-    print(f"{cfg.bot_name} 本地模式。/帮助 看功能，/图 路径 发图片，Ctrl+C 退出。\n")
+    brain = Brain(cfg)
+    # 用主人的身份聊，方便试主人专属的撒娇
+    ctx = Context(user_id=cfg.owner_id or "local", session_id="local", target_kind="cli", target_id="local")
+    print(f"{cfg.bot_name} 本地模式。/图 路径 发图片，/清空 忘掉对话，Ctrl+C 退出。\n")
     while True:
         try:
             line = await asyncio.to_thread(input, "你 > ")

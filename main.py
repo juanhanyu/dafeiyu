@@ -12,8 +12,6 @@ from botpy.message import C2CMessage, DirectMessage, GroupMessage, Message
 
 from atrei import config, hf
 from atrei.brain import Brain
-from atrei.scheduler import Scheduler
-from atrei.storage import Storage
 from atrei.tools import Context
 
 log = logging.getLogger("atrei")
@@ -30,7 +28,6 @@ def _session_init_trust_env(self, *args, **kwargs):
 aiohttp.ClientSession.__init__ = _session_init_trust_env
 
 CHUNK = 1500          # 单条消息最大字数，超出分条发
-REPLY_WINDOW = 290    # 被动回复有效期（秒），群聊官方限制约 5 分钟
 
 
 def split_text(text: str, size: int = CHUNK) -> list[str]:
@@ -44,24 +41,18 @@ def split_text(text: str, size: int = CHUNK) -> list[str]:
 
 
 class AtreiClient(botpy.Client):
-    def __init__(self, cfg, brain: Brain, scheduler: Scheduler, **kw):
+    def __init__(self, cfg, brain: Brain, **kw):
         super().__init__(**kw)
         self.cfg = cfg
         self.brain = brain
-        self.scheduler = scheduler
         self.http_session: aiohttp.ClientSession | None = None
-        # target_id -> [最近一条用户消息 id, 时间, 已用 msg_seq]，用于在窗口内"被动"推送提醒
+        # target_id -> [最近一条用户消息 id, 时间, 已用 msg_seq]，同一条消息的多次回复要递增 msg_seq
         self.last_msg: dict[str, list] = {}
-        scheduler.register("group", self.push_group)
-        scheduler.register("c2c", self.push_c2c)
-        scheduler.register("guild", self.push_guild)
-        scheduler.register("dm", self.push_dm)
 
     async def on_ready(self):
         log.info("「%s」上线了", self.robot.name)
         if self.http_session is None:  # 断线重连也会触发 on_ready，只初始化一次
             self.http_session = aiohttp.ClientSession()
-            self.scheduler_task = asyncio.create_task(self.scheduler.run_forever())
 
     # ---------- 收消息 ----------
     async def on_group_at_message_create(self, message: GroupMessage):
@@ -145,34 +136,6 @@ class AtreiClient(botpy.Client):
                 log.warning("图片下载失败：%s", e)
         return images
 
-    # ---------- 主动推送（提醒用） ----------
-    def _recent(self, target_id):
-        state = self.last_msg.get(target_id)
-        if state and time.time() - state[1] < REPLY_WINDOW:
-            state[2] += 1
-            return state[0], state[2]
-        return None, 1
-
-    async def push_group(self, target_id, user_id, text):
-        msg_id, seq = self._recent(target_id)
-        await self.api.post_group_message(group_openid=target_id, msg_type=0, content=text,
-                                          msg_id=msg_id, msg_seq=seq)
-        return True
-
-    async def push_c2c(self, target_id, user_id, text):
-        msg_id, seq = self._recent(target_id)
-        await self.api.post_c2c_message(openid=target_id, msg_type=0, content=text, msg_id=msg_id, msg_seq=seq)
-        return True
-
-    async def push_guild(self, target_id, user_id, text):
-        await self.api.post_message(channel_id=target_id, content=f"<@{user_id}> {text}")
-        return True
-
-    async def push_dm(self, target_id, user_id, text):
-        await self.api.post_dms(guild_id=target_id, content=text)
-        return True
-
-
 async def main():
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter("%(asctime)s [atrei] %(message)s", "%H:%M:%S"))
@@ -182,15 +145,12 @@ async def main():
     cfg = config.load()
     if not cfg.qq_appid or not cfg.qq_secret:
         raise SystemExit("请先在 .env 里填 QQ_APPID 和 QQ_SECRET（见 README）")
-    hf.restore_db(cfg.db_path)
-    storage = Storage(cfg.db_path)
-    brain = Brain(cfg, storage)
-    scheduler = Scheduler(storage, cfg.tz)
+    brain = Brain(cfg)
     intents = botpy.Intents(public_messages=True, public_guild_messages=True, direct_message=True)
-    client = AtreiClient(cfg, brain, scheduler, intents=intents, is_sandbox=cfg.qq_sandbox)
-    if hf.HOSTED:  # 在 Render / HF Space 上：开网页、保活、定时备份
+    client = AtreiClient(cfg, brain, intents=intents, is_sandbox=cfg.qq_sandbox)
+    if hf.HOSTED:  # 在 Render / HF Space 上：开网页、自我保活
         await hf.start_web(cfg.bot_name, lambda: client.http_session is not None)
-        background = [asyncio.create_task(hf.keepalive_loop()), asyncio.create_task(hf.backup_loop(storage))]
+        keepalive = asyncio.create_task(hf.keepalive_loop())
     async with client:
         await client.start(appid=cfg.qq_appid, secret=cfg.qq_secret)
 

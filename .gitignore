@@ -7,3 +7,4 @@ __pycache__/
 stickers/avatar_user.jpg
 stickers/avatar_small.jpg
 botpy.log
+render.env
