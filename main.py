@@ -11,11 +11,13 @@ import time
 import aiohttp
 import botpy
 from botpy.http import Route
+from botpy.connection import ConnectionState
 from botpy.manage import GroupManageEvent
 from botpy.message import C2CMessage, DirectMessage, GroupMessage, Message
 
 from atrei import config, faces, hf
 from atrei.brain import Brain
+from atrei.proactive import Proactive
 from atrei.tools import Context
 
 log = logging.getLogger("atrei")
@@ -43,6 +45,15 @@ def _keep_union_openid(user_cls, original_init):
 
 for _cls in (GroupMessage, C2CMessage):
     _keep_union_openid(_cls._User, _cls._User.__init__)
+
+
+# 群「全量模式」：后台打开「接收所有消息」后，群里每条消息都会推 GROUP_MESSAGE_CREATE。
+# botpy 不认识这个事件，这里补上，转给 on_group_message_create
+def _parse_group_message_create(self, payload):
+    self._dispatch("group_message_create", GroupMessage(self.api, payload.get("id", None), payload.get("d", {})))
+
+
+ConnectionState.parse_group_message_create = _parse_group_message_create
 
 INTRO = ("大家好呀~ 我是大肥鱼，一条拟人化的 DeepSeek 鲸鱼娘🐟\n"
          "我会陪大家聊天，还会说话、唱歌、画画，最拿手的是……吃白饭！🍚\n"
@@ -105,6 +116,18 @@ class AtreiClient(botpy.Client):
             await self.brain.imagegen.load()
             await self.brain.load_memory()
             self.memory_task = asyncio.create_task(self.brain.memory.run_forever(self.brain.histories, self.brain.meta))
+            self.proactive_task = asyncio.create_task(Proactive(self.brain, self.send_to_owner).run_forever())
+
+    async def send_to_owner(self, text: str):
+        """主动给主人发私聊（不回复任何消息，占用 QQ 的主动消息额度）。"""
+        await self.api.post_c2c_message(openid=self.cfg.owner_id, msg_type=0, content=text)
+
+    # ---------- 群里的普通聊天（全量模式） ----------
+    async def on_group_message_create(self, message: GroupMessage):
+        """只记下来当上下文，不回复；@ 鱼鱼的消息照旧由 on_group_at_message_create 回复。"""
+        text = decode_faces(re.sub(r"<@!?\w+>", "", message.content or "")).strip()
+        self.brain.log_group_message(message.group_openid, message.author.member_openid,
+                                     message.author.union_openid or "", text)
 
     # ---------- 被拉进群 ----------
     async def on_group_add_robot(self, event: GroupManageEvent):

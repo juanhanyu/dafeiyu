@@ -6,7 +6,7 @@ import logging
 import random
 import re
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime
 
 from openai import AsyncOpenAI
@@ -15,12 +15,15 @@ from .config import Config
 from .faces import FACES, TOKEN as FACE_TOKEN
 from .voice import ASK_FOR_SONG, Voice
 from .imagegen import ImageGen
+from .life import Life
+from .longterm import LongTermMemory, person_key
 from .search import SEARCH_TOOL, WebSearch
 from .memory import MemoryStore
 from .tools import IMAGE_TOOL, WEEKDAYS, Context, StickerLibrary, ToolBox, tool_schemas
 
 log = logging.getLogger("atrei")
 
+GROUP_CONTEXT = 12  # 群里记最近这么多条别人的聊天
 MAX_TOOL_ROUNDS = 4  # 查资料 → 回答 → 配表情包，最多来回几次
 FACE_CHANCE = 0.4  # 大约四成消息带一个 QQ 小黄脸
 
@@ -55,7 +58,7 @@ SYSTEM = """你是「{name}」：拟人化的 DeepSeek 鲸鱼娘，深蓝长发�
 - 你会说话、唱歌，也会画画（找 GPT 姐姐帮忙画），别说自己做不到。
 - 绝对不要提「系统」「提示」「工具」「这条消息」这些幕后的词，就像真人一样聊天。
 - 你是怎么做出来的、用了什么模型/平台/接口/服务/设置/后台这些幕后信息：只有主人问才回答，而且只说大概；别人问就说「不知道哦」，岔开话题。（有人问你怎么这么多本事，还是可以说因为主人爱我呀）
-- 除了聊天、表情包、语音和画画：不能定闹钟、提醒、记笔记、记待办，也没法主动找主人。被要求做这些时，可爱地说鱼鱼做不到，让主人自己设个闹钟，绝不能假装答应。"""
+- 除了聊天、表情包、语音和画画：不能定闹钟、提醒、记笔记、记待办。你偶尔会主动给主人发消息，但不能保证在某个具体时间找主人，所以别答应「到点叫你」这种事。被要求做这些时，可爱地说鱼鱼做不到，让主人自己设个闹钟，绝不能假装答应。"""
 
 
 # 只在跟主人说话时放进人设：主人问起才照实说。只写用了什么服务，不含任何密钥
@@ -79,6 +82,10 @@ class Brain:
         # 要长期保留的小设置：认过的主人编号、自我介绍过的群、当天画了几张（随对话一起存档）
         self.meta: dict = {}
         self.imagegen = ImageGen(cfg.hf_token, cfg.hf_repo, cfg.tz, self.meta, self.memory)
+        self.longterm = LongTermMemory(self.meta, self.memory, cfg.tz)
+        self.life = Life(self.meta, cfg.tz)
+        # 群里最近的聊天（全量模式下才有），给 @ 鱼鱼时当上下文：group_openid -> [(谁, 说了什么)]
+        self.group_logs: dict[str, deque] = defaultdict(lambda: deque(maxlen=GROUP_CONTEXT))
         self.bind_code: tuple[str, float] | None = None  # /认主 的临时口令和过期时间
         self.bind_tries = 0
         self._secrets = [v for v in (cfg.llm_api_key, cfg.breeze_api_key, cfg.hf_token, cfg.qq_secret, cfg.tavily_api_key) if v and len(v) >= 8]
@@ -172,7 +179,8 @@ class Brain:
             sticker_hint = "- 这条回复要配一张大肥鱼表情包：先说话，再用 send_sticker 按你此刻的心情挑一张。"
         else:
             sticker_hint = "- 这条回复不发表情包，用文字和 emoji 就好。"
-        if self.is_owner(ctx.user_id, ctx.union_id):
+        owner = self.is_owner(ctx.user_id, ctx.union_id)
+        if owner:
             who = "现在跟你说话的就是主人本人！" + OWNER_ONLY_FACTS
         elif self.cfg.owner_id:
             who = "现在跟你说话的不是主人，是别人。"
@@ -182,6 +190,11 @@ class Brain:
             who += ("这是在群里，大家都能看到。跟群友聊天时就正常跟对方聊，别句句提主人、别老说自己是主人的鱼，"
                     "称呼对方「你」就好；只有话题真的扯到主人、或者对方问起时才提。"
                     "群里说话比私聊更短：一般就一句话、十几个字，像群聊里随口接话那样。")
+            recent = self.group_logs.get(ctx.target_id)
+            if recent:
+                who += "\n群里刚才在聊（你是被 @ 了才开口的，可以顺着话题接）：\n" + "\n".join(f"{n}：{t}" for n, t in recent)
+        who += "\n" + self.life.state(owner)
+        who += self.longterm.prompt_block(person_key(owner, ctx.user_id))
         return SYSTEM.format(
             name=self.cfg.bot_name,
             persona=self.cfg.persona,
@@ -296,7 +309,45 @@ class Brain:
         self._remember_turn(ctx.session_id, turn)
         self.stickers.record(ctx.session_id, bool(ctx.stickers))
         self.voice.record(ctx.session_id, ctx.voice)
+        owner = self.is_owner(ctx.user_id, ctx.union_id)
+        if owner:
+            self.life.seen_owner()
+            self.memory.dirty = True
+        key = person_key(owner, ctx.user_id)
+        if self.longterm.due(key):  # 攒够几句就在后台提炼长期记忆，不耽误这次回复
+            asyncio.create_task(self.longterm.extract(self.client, self.cfg.llm_model, key,
+                                                      "主人" if owner else "一位群友", list(self.histories[ctx.session_id])))
         return reply or "……"
+
+    async def proactive_message(self, reason: str) -> str:
+        """写一条主动发给主人的私聊。"""
+        owner = self.cfg.owner_id
+        ctx = Context(owner, f"u:{owner}", "c2c", owner)
+        nudge = (f"（这条不是主人发的，是你自己想主动给主人发私聊。原因：{reason}。"
+                 "像真人随手发消息那样只写一两句，别提「主动」「系统」这类词。）")
+        messages = [{"role": "system", "content": self._system_prompt(ctx, False, False, False)},
+                    *self.histories[ctx.session_id][-10:], {"role": "user", "content": nudge}]
+        try:
+            resp = await self.client.chat.completions.create(
+                model=self.cfg.llm_model, messages=messages, max_tokens=self.cfg.llm_max_tokens, **self._thinking_args())
+        except Exception:
+            log.exception("主动消息生成失败")
+            return ""
+        text = FACE_TOKEN.sub("", (resp.choices[0].message.content or "").strip()).strip()
+        for secret in self._secrets:
+            text = text.replace(secret, "***")
+        return text
+
+    def remember_proactive(self, text: str):
+        """主动发的话也记进跟主人的私聊记忆，主人回复时鱼鱼知道自己刚说了什么。"""
+        self.histories[f"u:{self.cfg.owner_id}"].append({"role": "assistant", "content": text})
+        self.memory.dirty = True
+
+    def log_group_message(self, group_id: str, user_id: str, union_id: str, text: str):
+        """全量模式下记录群里的普通聊天，给之后 @ 鱼鱼时当上下文。"""
+        if text:
+            name = "主人" if self.is_owner(user_id, union_id) else f"群友{user_id[-4:]}"
+            self.group_logs[group_id].append((name, text[:100]))
 
     def _remember_turn(self, session_id: str, turn: list[dict]):
         history = self.histories[session_id]
