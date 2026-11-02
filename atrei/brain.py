@@ -3,18 +3,22 @@ import asyncio
 import base64
 import json
 import logging
+import random
+import re
 from collections import defaultdict
 from datetime import datetime
 
 from openai import AsyncOpenAI
 
 from .config import Config
+from .faces import FACES, TOKEN as FACE_TOKEN
 from .voice import Voice
 from .tools import WEEKDAYS, Context, StickerLibrary, ToolBox, tool_schemas
 
 log = logging.getLogger("atrei")
 
 MAX_TOOL_ROUNDS = 3
+FACE_CHANCE = 0.4  # 大约四成消息带一个 QQ 小黄脸
 
 HELP = "咕噜~ 本鱼就是陪你聊天的，想说啥直接说，发图片也行~\n/清空 可以让鱼鱼忘掉刚才聊的"
 
@@ -37,7 +41,9 @@ SYSTEM = """你是「{name}」：拟人化的 DeepSeek 鲸鱼娘，深蓝长发�
 说话方式（最重要）：
 - 像朋友发 QQ 消息一样聊天，一般只回 1~2 行；内容确实多的时候最多 3~4 行，绝对不要长篇大论。
 - 不分点、不列清单、不写标题，不用 Markdown 和 LaTeX，不发网址。
-- 有时候在话里加一两个 emoji 表情，比如 🥺😆😋💕🐟✨😤😴，像真人聊天那样点缀，大概一半的消息带，不要每句都加。
+- 像真人一样偶尔用 QQ 小黄脸点缀，直接写在句子里，比如「好耶[呲牙]」「哼[撇嘴]」，一条最多一个。{face_hint}
+  只能用这些：{faces}。别的写法（包括 [微笑]，它在网上是嘲讽的意思）都不要用。
+  偶尔也可以用 🍚🐟✨ 这类 emoji，但以小黄脸为主。
 - 用户发来的「[表情:微笑]」这种是 QQ 表情，看懂意思接着聊就好。
 - 用户问很复杂的问题，也只挑最关键的一两句说，想听细节让主人再问。
 - 看到图片就像朋友一样简单说说看到了什么、有什么想法。
@@ -88,7 +94,7 @@ class Brain:
         return None  # 不认识的 / 开头内容交给大模型
 
     # ---------- 大模型 ----------
-    def _system_prompt(self, ctx: Context, sticker_ok: bool, voice_ok: bool = False) -> str:
+    def _system_prompt(self, ctx: Context, sticker_ok: bool, voice_ok: bool = False, face_ok: bool = True) -> str:
         now = datetime.now(self.cfg.tz)
         if sticker_ok:
             sticker_hint = "- 这条回复要配一张大肥鱼表情包：先说话，再用 send_sticker 按你此刻的心情挑一张。"
@@ -104,6 +110,8 @@ class Brain:
             name=self.cfg.bot_name,
             persona=self.cfg.persona,
             sticker_hint=sticker_hint,
+            face_hint=("这条回复可以带一个。" if face_ok else "这条回复不要用小黄脸。"),
+            faces="、".join(f"[{n}]" for n in FACES),
             voice_hint=("- 这条回复会用你的声音念成语音发出去：只说一两句适合念出来的口语，不要 emoji、颜文字和符号。" if voice_ok else ""),
             who=who,
             now=now.strftime("%Y-%m-%d %H:%M") + f" 周{WEEKDAYS[now.weekday()]}",
@@ -134,7 +142,8 @@ class Brain:
         # 发图频率由代码控制：这条不该发表情包时，干脆不给模型这个工具
         sticker_ok = self.stickers.allowed(ctx.session_id, text)
         ctx.voice = self.voice.wanted(ctx.session_id, text)
-        messages = [{"role": "system", "content": self._system_prompt(ctx, sticker_ok, ctx.voice)}, *history, user_msg]
+        face_ok = random.random() < FACE_CHANCE  # 小黄脸也由代码控制频率
+        messages = [{"role": "system", "content": self._system_prompt(ctx, sticker_ok, ctx.voice, face_ok)}, *history, user_msg]
         tool_args = {"tools": self.tool_schemas} if sticker_ok else {}
 
         reply = ""
@@ -180,9 +189,12 @@ class Brain:
         else:
             reply = "咕噜~"
 
-        # 历史里只留文字（工具调用不进历史，免得下一轮没给工具时接口报错），发过的表情包用一句话记下
-        memo = f"\n[发了表情包：{ctx.stickers[0]['desc'][:30]}]" if ctx.stickers else ""
-        turn.append({"role": "assistant", "content": (reply or "……") + memo})
+        # 模型偶尔会学着写「[发了表情包：…]」这种旁白，去掉
+        reply = re.sub(r"\n*[\[【（(]发了?(?:一张|个)?表情包[^\]】）)]*[\]】）)]", "", reply or "").strip()
+        if not face_ok:
+            reply = FACE_TOKEN.sub("", reply).strip()
+        # 历史里只留文字：工具调用不进历史，免得下一轮没给工具时接口报错
+        turn.append({"role": "assistant", "content": reply or "……"})
         self._remember_turn(ctx.session_id, turn)
         self.stickers.record(ctx.session_id, bool(ctx.stickers))
         self.voice.record(ctx.session_id, ctx.voice)

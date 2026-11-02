@@ -42,7 +42,7 @@ class Voice:
 
     async def synthesize(self, text: str) -> bytes:
         """把文字变成 QQ 能播的 silk 语音。"""
-        clean = EMOJI.sub("", text).replace("~", "。").strip()[:MAX_CHARS]
+        clean = re.sub(r"\[[^\[\]]{1,4}\]", "", EMOJI.sub("", text)).replace("~", "。").strip()[:MAX_CHARS]
         async with aiohttp.ClientSession() as s:
             async with s.post(API.format(voice_id=self.voice_id), json={"text": clean},
                               headers={"xi-api-key": self.api_key},

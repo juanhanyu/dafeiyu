@@ -11,7 +11,7 @@ import botpy
 from botpy.http import Route
 from botpy.message import C2CMessage, DirectMessage, GroupMessage, Message
 
-from atrei import config, hf
+from atrei import config, faces, hf
 from atrei.brain import Brain
 from atrei.tools import Context
 
@@ -107,14 +107,10 @@ class AtreiClient(botpy.Client):
         log.info("[%s] %s%s", ctx.session_id, text[:60], f" +{len(images)}图" if images else "")
         self.last_msg[ctx.target_id] = [message.id, time.time(), 0]
 
-        if raw.startswith("/表情测试"):
-            await self._face_test(ctx, raw, send)
-            return
-
         reply = await self.brain.handle(ctx, text, images)
         if not (ctx.voice and await self._send_voice(ctx, message, send, reply)):
-            for chunk in split_text(reply):
-                await self._send_passive(ctx.target_id, send, chunk)
+            for chunk in split_text(faces.strip_unknown(reply)):
+                await self._send_text(ctx, send, chunk)
         for sticker in ctx.stickers:
             try:
                 await self._send_sticker(ctx, message, send, sticker)
@@ -122,24 +118,17 @@ class AtreiClient(botpy.Client):
             except Exception as e:
                 log.warning("表情包 %s 发送失败：%s", sticker["id"], e)
 
-    async def _face_test(self, ctx: Context, raw: str, send):
-        """实验第二轮：普通文字发不了 QQ 表情，试 Markdown 消息（msg_type=2），把黄脸图片当行内小图嵌进去。"""
-        face = "https://koishi.js.org/QFace/assets/qq_emoji/14"
-        variants = [
-            ("F", f"鱼鱼笑一个 ![微笑 #24px #24px]({face}/png/14.png) 这是F"),
-            ("G", f"动起来的 ![微笑 #24px #24px]({face}/apng/14.png) 这是G"),
-            ("H", "Markdown 里的 <emoji:14> 这是H"),
-        ]
-        state = self.last_msg[ctx.target_id]
-        for label, content in variants:
+    async def _send_text(self, ctx: Context, send, text: str):
+        """带 [可爱] 这类 QQ 表情的回复用 Markdown 发（黄脸是行内小图），失败或频道里就去掉表情发文字。"""
+        if faces.has_faces(text) and ctx.target_kind in ("group", "c2c"):
+            state = self.last_msg[ctx.target_id]
             state[2] += 1
             try:
-                await send(msg_type=2, markdown={"content": content}, msg_seq=state[2])
+                await send(msg_type=2, markdown={"content": faces.to_markdown(text)}, msg_seq=state[2])
+                return
             except Exception as e:
-                log.warning("表情测试 %s 失败：%s", label, e)
-                state[2] += 1
-                await send(content=f"{label} 发送失败：{str(e)[:80]}", msg_seq=state[2])
-        log.info("表情测试已发出 %s", [v[0] for v in variants])
+                log.warning("Markdown 表情发送失败，改发文字：%s", e)
+        await self._send_passive(ctx.target_id, send, faces.TOKEN.sub("", text).strip() or "……")
 
     async def _send_voice(self, ctx: Context, message, send, text: str) -> bool:
         """把回复念成语音发出去；失败就返回 False，改发文字。"""
