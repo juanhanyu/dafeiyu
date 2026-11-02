@@ -1,0 +1,8 @@
+.env
+.venv
+data
+bot.log
+__pycache__
+*.pyc
+stickers/avatar_user.jpg
+stickers/avatar_small.jpg
