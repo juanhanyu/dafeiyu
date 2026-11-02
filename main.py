@@ -41,7 +41,7 @@ def decode_faces(text: str) -> str:
         if m.group(2):
             try:
                 raw = m.group(2) + "=" * (-len(m.group(2)) % 4)
-                name = json.loads(base64.b64decode(raw)).get("text", "").lstrip("/")
+                name = json.loads(base64.b64decode(raw)).get("text", "").strip("/[]")
             except Exception:
                 pass
         return f"[表情:{name}]" if name else "[表情]"
@@ -99,10 +99,17 @@ class AtreiClient(botpy.Client):
         await self._handle(ctx, message, lambda **kw: message.reply(**kw))
 
     async def _handle(self, ctx: Context, message, send):
-        text = decode_faces(re.sub(r"<@!?\d+>", "", message.content or "")).strip()
+        raw = re.sub(r"<@!?\d+>", "", message.content or "").strip()
+        if "<faceType" in raw:  # 记下 QQ 表情的原始格式，方便研究怎么发
+            log.info("收到 QQ 表情原文：%s", raw[:300])
+        text = decode_faces(raw)
         images = await self._download_images(message.attachments)
         log.info("[%s] %s%s", ctx.session_id, text[:60], f" +{len(images)}图" if images else "")
         self.last_msg[ctx.target_id] = [message.id, time.time(), 0]
+
+        if raw.startswith("/表情测试"):
+            await self._face_test(ctx, raw, send)
+            return
 
         reply = await self.brain.handle(ctx, text, images)
         for chunk in split_text(reply):
@@ -112,6 +119,26 @@ class AtreiClient(botpy.Client):
                 await self._send_image(ctx, message, send, path)
             except Exception as e:
                 log.warning("表情包发送失败：%s", e)
+
+    async def _face_test(self, ctx: Context, raw: str, send):
+        """实验：用几种写法发「微笑」，看 QQ 里哪种能显示成真正的 QQ 表情。"""
+        def ext(name):
+            return base64.b64encode(json.dumps({"text": name}, ensure_ascii=False).encode()).decode()
+        variants = [
+            ("A", f'<faceType=1,faceId="14",ext="{ext("[微笑]")}">'),
+            ("B", f'<faceType=1,faceId="14",ext="{ext("/微笑")}">'),
+            ("C", '<faceType=1,faceId="14">'),
+            ("D", "<emoji:14>"),
+        ]
+        echoed = FACE_TAG.search(raw)
+        if echoed:  # 把用户发来的表情原样发回去
+            variants.append(("E", echoed.group(0)))
+        for label, face in variants:
+            try:
+                await self._send_passive(ctx.target_id, send, f"{label}：{face} 这是{label}")
+            except Exception as e:
+                log.warning("表情测试 %s 失败：%s", label, e)
+        log.info("表情测试已发出 %s", [v[0] for v in variants])
 
     async def _send_image(self, ctx: Context, message, send, path):
         data = path.read_bytes()
