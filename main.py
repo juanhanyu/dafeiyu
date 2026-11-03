@@ -83,17 +83,41 @@ def speaker_name(author: dict) -> str:
     return (author or {}).get("username") or f"群友{((author or {}).get('member_openid') or '')[-4:]}"
 
 
-def attached_messages(raw: dict) -> list[tuple[str, str]]:
-    """消息里附带的聊天记录 / 引用 / 「@ 时附带的最近消息」都在 msg_elements 里（可以嵌套），拆成 (谁, 说了什么)。"""
+# 「获取 @ 机器人的最近 10 条消息」模式：QQ 把最近几条塞进 msg_elements 里的一整段文字（实测，文档没写）：
+#   === 消息 1 ===\n[消息内容] ……\n\n=== 消息 2 ===\n[消息内容] ……
+# 没有发言人；最后一条就是这次 @ 的消息本身；鱼鱼自己发过的 Markdown（小黄脸是图片链接）也在里面
+RECENT_BLOCK = re.compile(r"=== 消息 \d+ ===\s*")
+MD_IMAGE = re.compile(r"!\[([^\]#]*?)\s*(?:#[^\]]*)?\]\([^)]*\)")
+
+
+def _clean_attached(text: str) -> str:
+    text = MD_IMAGE.sub(lambda m: f"[{m.group(1).strip()}]" if m.group(1).strip() else "[图片]", text)
+    text = re.sub(r"\[消息内容\]\s*", "", text)
+    text = re.sub(r"@\S+\s*", "", decode_faces(AT_TAG.sub("", text)))
+    return " ".join(text.split())
+
+
+def attached_messages(raw: dict, current: str = "") -> list[tuple[str | None, str]]:
+    """消息里附带的「最近几条」、聊天记录、引用都在 msg_elements 里（可嵌套），拆成 (谁, 说了什么)。
+    谁为 None 表示 QQ 没给发言人。"""
     out = []
 
     def walk(elements, quoted):
         for el in elements or []:
-            text = decode_faces(AT_TAG.sub("", el.get("content") or "")).strip()
-            if el.get("attachments"):
-                text = (text + " [图片]").strip()
-            if text:
-                out.append((speaker_name(el.get("author")) + ("（被引用）" if quoted else ""), text[:100]))
+            content = el.get("content") or ""
+            if RECENT_BLOCK.search(content):  # 「最近几条」格式
+                blocks = [_clean_attached(b) for b in RECENT_BLOCK.split(content)]
+                blocks = [b for b in blocks if b]
+                cur = _clean_attached(current)
+                if blocks and cur and (blocks[-1] == cur or cur in blocks[-1]):
+                    blocks.pop()  # 最后一条就是这次 @ 的消息
+                out.extend((None, b[:100]) for b in blocks)
+            else:
+                text = _clean_attached(content)
+                if el.get("attachments"):
+                    text = (text + " [图片]").strip()
+                if text:
+                    out.append((speaker_name(el.get("author")) + ("（被引用）" if quoted else ""), text[:100]))
             walk(el.get("msg_elements"), quoted)
 
     walk(raw.get("msg_elements"), raw.get("message_type") == 103)
@@ -217,8 +241,8 @@ class AtreiClient(botpy.Client):
             samples = self.brain.meta.setdefault("raw_samples", [])
             samples.append(sample)
             del samples[:-5]
-        for name, text in attached_messages(raw):  # 「@ 时附带最近消息」和引用的内容，也当群上下文
-            self.brain.log_group_line(group, name, text)
+        for name, text in attached_messages(raw, message.content or ""):  # 附带的最近消息、引用，也当群上下文
+            self.brain.log_group_line(group, name, text, dedupe=True)
         text = decode_faces(AT_TAG.sub("", message.content or "")).strip()
         if message.attachments:
             text = (text + " [发了图片/表情包]").strip()

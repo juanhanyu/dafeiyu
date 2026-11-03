@@ -350,10 +350,19 @@ class Brain:
             return "主人"
         return author.get("username") or f"群友{(author.get('member_openid') or '')[-4:]}"
 
-    def log_group_line(self, group_id: str, name: str, text: str):
-        """记一条群聊（别人的普通聊天、附带的上下文、鱼鱼自己的回复），之后被 @ 时当上下文。"""
-        if text:
-            self.group_logs[group_id].append((name, text[:100]))
+    def log_group_line(self, group_id: str, name: str | None, text: str, dedupe: bool = False):
+        """记一条群聊（别人的普通聊天、附带的上下文、鱼鱼自己的回复），之后被 @ 时当上下文。
+        dedupe：附带的「最近几条」里常有已经记过的话（比如鱼鱼自己刚才的回复），记过就跳过。
+        name 为 None（QQ 没给发言人）时：跟鱼鱼说过的话对得上就算她自己，否则叫「群友」。"""
+        if not text:
+            return
+        logs = self.group_logs[group_id]
+        key = text[:30]
+        if dedupe and any(t[:30] == key or key in t for _, t in logs):
+            return
+        if name is None:
+            name = "群友"
+        logs.append((name, text[:100]))
 
     def _remember_turn(self, session_id: str, turn: list[dict]):
         history = self.histories[session_id]
