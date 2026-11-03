@@ -240,12 +240,17 @@ class Brain:
         face_ok = random.random() < FACE_CHANCE  # 小黄脸也由代码控制频率
         messages = [{"role": "system", "content": self._system_prompt(ctx, sticker_ok, ctx.voice, face_ok)}, *history, user_msg]
         tools = list(self.tool_schemas) if sticker_ok else []
-        if self.imagegen.offered(ctx.user_id, text):
+        if self.imagegen.enabled:
+            # 画画工具只要还有额度就一直给：别人常常只发一段画面描述（「Hello Kitty 做成果冻软糖，微距摄影」），
+            # 不带「画」「图」字，以前没给工具，她嘴上答应画却画不出来
             left = self.imagegen.quota_left()
             if left > 0:
                 tools.append(IMAGE_TOOL)
-            messages[0]["content"] += ("\n- 对方可能想看图：要是想要一张新画的图（比如你在干什么的样子、某个场景），就用 generate_image 画；只是要表情包就别画。别提还能画几张。" if left > 0
-                                       else "\n- 对方想让你画画，但今天画不了了：要说「本鱼今天已经没脸找GPT姐姐画画啦~」，可以再撒个娇。")
+            if self.imagegen.offered(ctx.user_id, text):
+                messages[0]["content"] += ("\n- 对方可能想看图：要是想要一张新画的图（比如你在干什么的样子、某个场景），就用 generate_image 画；只是要表情包就别画。别提还能画几张。" if left > 0
+                                           else "\n- 对方想让你画画，但今天画不了了：要说「本鱼今天已经没脸找GPT姐姐画画啦~」，可以再撒个娇。")
+            elif left > 0:
+                messages[0]["content"] += "\n- 要是对方发的是一段画面描述、想让你照着画，就用 generate_image 画。说了要画就一定要调用它，不能光嘴上答应。"
         if self.search.enabled:  # 搜索工具一直给，但描述里写明一般不用，只在不懂又关键时才查
             tools.append(SEARCH_TOOL)
         tool_args = {"tools": tools} if tools else {}

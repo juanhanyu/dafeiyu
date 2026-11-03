@@ -51,11 +51,12 @@ for _cls in (GroupMessage, C2CMessage):
 
 # botpy 还会丢掉群消息里的昵称、@ 列表里的 bot 标记、附带的聊天记录/引用（msg_elements），把原始数据留一份
 class RawGroupMessage(GroupMessage):
-    __slots__ = ("raw",)
+    __slots__ = ("raw", "context_images")
 
     def __init__(self, api, event_id, data):
         super().__init__(api, event_id, data)
         self.raw = data
+        self.context_images = []  # @ 鱼鱼时顺带要看的群里最近的图片（{"url", "sticker"}）
 
 
 # 群 @ 事件和群「全量模式」事件都用 RawGroupMessage。全量模式（后台/群设置里开「获取群内全部消息」）下，
@@ -88,36 +89,62 @@ def speaker_name(author: dict) -> str:
 # 没有发言人；最后一条就是这次 @ 的消息本身；鱼鱼自己发过的 Markdown（小黄脸是图片链接）也在里面
 RECENT_BLOCK = re.compile(r"=== 消息 \d+ ===\s*")
 MD_IMAGE = re.compile(r"!\[([^\]#]*?)\s*(?:#[^\]]*)?\]\([^)]*\)")
+# 附带消息里的图片是一行文字（实测）：[附件1] 类型:动图 文件名:x.jpg 尺寸:300x436 大小:4.2MB URL:https://...
+ATTACH_LINE = re.compile(r"\[附件\d+\]\s*类型:(\S+)(?:[^\n]*?尺寸:(\d+)x(\d+))?[^\n]*?URL:(\S+)")
+STICKER_FACE = re.compile(r"<faceType=6[^>]*>")  # 自定义表情包的标记，图片在附件里
+# @ 鱼鱼时提到这些词、自己又没带图，就把群里最近的图拿来看
+LOOK_BACK = re.compile(r"图|表情|照片|截图|上面|上文|刚才|前面|这张|那张|看看|看下|看一下")
+LOOK_BACK_MAX = 3
 
 
 def _clean_attached(text: str) -> str:
+    text = ATTACH_LINE.sub("", STICKER_FACE.sub("", text))
     text = MD_IMAGE.sub(lambda m: f"[{m.group(1).strip()}]" if m.group(1).strip() else "[图片]", text)
     text = re.sub(r"\[消息内容\]\s*", "", text)
     text = re.sub(r"@\S+\s*", "", decode_faces(AT_TAG.sub("", text)))
     return " ".join(text.split())
 
 
-def attached_messages(raw: dict, current: str = "") -> list[tuple[str | None, str]]:
-    """消息里附带的「最近几条」、聊天记录、引用都在 msg_elements 里（可嵌套），拆成 (谁, 说了什么)。
-    谁为 None 表示 QQ 没给发言人。"""
+def _attachments_in(text: str) -> list[dict]:
+    """附带消息里的图片链接。动图、或者带表情包标记、或者尺寸小的，算表情包。"""
+    out, sticker_mark = [], bool(STICKER_FACE.search(text))
+    for kind, w, h, url in ATTACH_LINE.findall(text):
+        if w and h:  # 有尺寸就按尺寸判断：QQ 给大截图也会挂表情包标记
+            sticker = kind == "动图" or max(int(w), int(h)) <= STICKER_MAX_SIDE
+        else:
+            sticker = kind == "动图" or sticker_mark
+        out.append({"url": url, "sticker": sticker})
+    return out
+
+
+def _label(text: str, atts: list[dict]) -> str:
+    if not atts:
+        return text
+    tag = "表情包" if all(a["sticker"] for a in atts) else "图片"
+    return (text + f" [发了{tag}]").strip()
+
+
+def attached_messages(raw: dict, current: str = "") -> list[tuple[str | None, str, list[dict]]]:
+    """消息里附带的「最近几条」、聊天记录、引用都在 msg_elements 里（可嵌套），拆成 (谁, 说了什么, 图片)。
+    谁为 None 表示 QQ 没给发言人；图片是 {"url", "sticker"}。"""
     out = []
 
     def walk(elements, quoted):
         for el in elements or []:
             content = el.get("content") or ""
             if RECENT_BLOCK.search(content):  # 「最近几条」格式
-                blocks = [_clean_attached(b) for b in RECENT_BLOCK.split(content)]
-                blocks = [b for b in blocks if b]
+                blocks = [(_clean_attached(b), _attachments_in(b)) for b in RECENT_BLOCK.split(content)]
+                blocks = [(t, a) for t, a in blocks if t or a]
                 cur = _clean_attached(current)
-                if blocks and cur and (blocks[-1] == cur or cur in blocks[-1]):
+                if blocks and cur and (blocks[-1][0] == cur or cur in blocks[-1][0]):
                     blocks.pop()  # 最后一条就是这次 @ 的消息
-                out.extend((None, b[:100]) for b in blocks)
+                out.extend((None, _label(t, a)[:100], a) for t, a in blocks)
             else:
-                text = _clean_attached(content)
-                if el.get("attachments"):
-                    text = (text + " [图片]").strip()
+                atts = [{"url": a.get("url"), "sticker": "gif" in (a.get("content_type") or "")}
+                        for a in el.get("attachments") or [] if (a.get("content_type") or "").startswith("image")]
+                text = _label(_clean_attached(content), atts)
                 if text:
-                    out.append((speaker_name(el.get("author")) + ("（被引用）" if quoted else ""), text[:100]))
+                    out.append((speaker_name(el.get("author")) + ("（被引用）" if quoted else ""), text[:100], atts))
             walk(el.get("msg_elements"), quoted)
 
     walk(raw.get("msg_elements"), raw.get("message_type") == 103)
@@ -200,6 +227,7 @@ class AtreiClient(botpy.Client):
         self.brain = brain
         self.http_session: aiohttp.ClientSession | None = None
         self.seen_ids: deque = deque(maxlen=500)  # 最近处理过的消息 id，防止同一条群消息回两次
+        self.group_images: dict[str, deque] = {}  # 群里最近发过的图片链接
         self.raw_logged = 0
 
     async def on_ready(self):
@@ -241,15 +269,21 @@ class AtreiClient(botpy.Client):
             samples = self.brain.meta.setdefault("raw_samples", [])
             samples.append(sample)
             del samples[:-5]
-        for name, text in attached_messages(raw, message.content or ""):  # 附带的最近消息、引用，也当群上下文
+        for name, text, atts in attached_messages(raw, message.content or ""):  # 附带的最近消息、引用，也当群上下文
             self.brain.log_group_line(group, name, text, dedupe=True)
-        text = decode_faces(AT_TAG.sub("", message.content or "")).strip()
-        if message.attachments:
-            text = (text + " [发了图片/表情包]").strip()
+            self.remember_group_images(group, atts)
+        own_atts = [{"url": a.url if a.url.startswith("http") else "https://" + a.url.lstrip("/"),
+                     "sticker": "gif" in (a.content_type or "") or "faceType=6" in (message.content or "")}
+                    for a in message.attachments or [] if (a.content_type or "").startswith("image") and a.url]
+        text = _label(decode_faces(AT_TAG.sub("", STICKER_FACE.sub("", message.content or ""))).strip(), own_atts)
         speaker = self.brain.group_speaker(author)
         if not (at_event or mentions_bot(raw)):
             self.brain.log_group_line(group, speaker, text)
+            self.remember_group_images(group, own_atts)
             return  # 没 @ 鱼鱼，只记录不回复
+        # @ 鱼鱼时自己没带图、又提到图/表情包（「看看上文表情包」），就把群里最近的几张拿来看
+        if not own_atts and LOOK_BACK.search(text):
+            message.context_images = list(self.group_images.get(group, []))[-LOOK_BACK_MAX:]
         uid = message.author.member_openid
         ctx = Context(user_id=uid, session_id=f"g:{group}:{uid}", target_kind="group", target_id=group,
                       is_group=True, union_id=message.author.union_openid or "")
@@ -258,8 +292,16 @@ class AtreiClient(botpy.Client):
             group_openid=group, msg_id=message.id, **{"msg_type": 0, **kw}))
         # 回复完再记：这条 @ 消息和鱼鱼的回复都进群上下文（回复前记的话，这条会在上下文里重复一次）
         self.brain.log_group_line(group, speaker + "（@你）", text)
+        self.remember_group_images(group, own_atts)
         if reply:
             self.brain.log_group_line(group, "你（大肥鱼）", reply)
+
+    def remember_group_images(self, group: str, atts: list[dict]):
+        """记住群里最近发过的图片链接（不下载），有人 @ 鱼鱼说「看看上面的图」时再拿出来看。"""
+        cache = self.group_images.setdefault(group, deque(maxlen=6))
+        for a in atts:
+            if a.get("url") and all(a["url"] != b["url"] for b in cache):
+                cache.append(a)
 
     # ---------- 被拉进群 ----------
     async def on_group_add_robot(self, event: GroupManageEvent):
@@ -301,6 +343,12 @@ class AtreiClient(botpy.Client):
             log.info("收到 QQ 表情原文：%s", raw[:300])
         text = decode_faces(raw)
         images, stickers = await self._download_images(message.attachments, sticker_hint="faceType=6" in raw)
+        context_images = getattr(message, "context_images", None) or []
+        if context_images:  # 「看看上文表情包」：把群里刚才的几张图一起交给鱼鱼看
+            more, more_stickers = await self._download_urls(context_images)
+            images += more
+            stickers += more_stickers
+            text = (text + f"\n[附上了群里刚才发的 {len(more)} 张图给你看，按发送顺序]").strip()
         if stickers:  # 告诉鱼鱼对方发的是表情包，让她像朋友斗图那样接梗，而不是一本正经描述图片
             text = (text + f"\n[对方发了{'一个' if stickers == 1 else f'{stickers}个'}表情包]").strip()
         log.info("[%s] %s%s%s", ctx.session_id, text[:60], f" +{len(images)}图" if images else "",
@@ -406,6 +454,20 @@ class AtreiClient(botpy.Client):
             log.warning("发送失败：%s", e)
             if "url" in str(e).lower() or "链接" in str(e):
                 await send(content=re.sub(r"https?://\S+|\b\w+\.(com|cn|net|org)\S*", "[链接已隐藏]", content))
+
+    async def _download_urls(self, items: list[dict]) -> tuple[list[tuple[str, bytes]], int]:
+        """按链接下载群里之前发的图（附带消息里给的 multimedia.nt.qq.com.cn 链接），统一成静态 PNG。"""
+        images, stickers = [], 0
+        for it in items:
+            try:
+                async with self.http_session.get(it["url"], timeout=aiohttp.ClientTimeout(total=20)) as r:
+                    data = await r.read()
+                png, is_sticker = await asyncio.to_thread(normalize_image, data, r.headers.get("content-type", ""))
+                images.append(("image/png", png))
+                stickers += is_sticker or it.get("sticker", False)
+            except Exception as e:
+                log.warning("群里之前的图下载/处理失败：%s", e)
+        return images, stickers
 
     async def _download_images(self, attachments, sticker_hint: bool = False) -> tuple[list[tuple[str, bytes]], int]:
         """下载图片并统一成看图模型吃得下的静态 PNG；返回 (图片, 其中几张像表情包)。"""
