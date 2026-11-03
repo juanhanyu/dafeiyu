@@ -20,6 +20,7 @@ from botpy.message import C2CMessage, DirectMessage, GroupMessage, Message
 from atrei import config, faces, hf
 from atrei.brain import Brain
 from atrei.proactive import Proactive
+from atrei.memory import ArchiveLogHandler
 from atrei.tools import Context
 
 log = logging.getLogger("atrei")
@@ -183,6 +184,9 @@ class AtreiClient(botpy.Client):
             self.http_session = aiohttp.ClientSession()
             await self.brain.imagegen.load()
             await self.brain.load_memory()
+            archive = ArchiveLogHandler(self.brain.meta, self.brain.memory)
+            log.addHandler(archive)
+            logging.getLogger("botpy").addHandler(archive)  # botpy 的连接/报错日志也存一份
             self.memory_task = asyncio.create_task(self.brain.memory.run_forever(self.brain.histories, self.brain.meta))
             self.proactive_task = asyncio.create_task(Proactive(self.brain, self.send_to_owner).run_forever())
 
@@ -208,8 +212,11 @@ class AtreiClient(botpy.Client):
         group, author = message.group_openid, raw.get("author") or {}
         if raw.get("msg_elements") and self.raw_logged < 5:  # 附带消息的格式文档没写清，先记几条原样的方便核对
             self.raw_logged += 1
-            log.info("群消息附带内容（原样）：%s", json.dumps(
-                {k: raw.get(k) for k in ("message_type", "msg_elements", "message_scene")}, ensure_ascii=False)[:1500])
+            sample = {k: raw.get(k) for k in ("message_type", "msg_elements", "message_scene")}
+            log.info("群消息附带内容（原样）：%s", json.dumps(sample, ensure_ascii=False)[:1500])
+            samples = self.brain.meta.setdefault("raw_samples", [])
+            samples.append(sample)
+            del samples[:-5]
         for name, text in attached_messages(raw):  # 「@ 时附带最近消息」和引用的内容，也当群上下文
             self.brain.log_group_line(group, name, text)
         text = decode_faces(AT_TAG.sub("", message.content or "")).strip()

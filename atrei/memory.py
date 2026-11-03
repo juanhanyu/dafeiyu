@@ -26,6 +26,26 @@ def _text_only(history: list[dict]) -> list[dict]:
     return out
 
 
+class ArchiveLogHandler(logging.Handler):
+    """把最近的日志也存进存档（meta["logs"]），这样不开 Render 网页、在电脑上读存档就能看日志。"""
+    KEEP = 300
+
+    def __init__(self, meta: dict, store: "MemoryStore"):
+        super().__init__(logging.INFO)
+        self.meta = meta
+        self.store = store
+        self.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%m-%d %H:%M:%S"))
+
+    def emit(self, record):
+        try:
+            logs = self.meta.setdefault("logs", [])
+            logs.append(self.format(record)[:600])
+            del logs[:-self.KEEP]
+            self.store.dirty = True
+        except Exception:
+            pass
+
+
 class MemoryStore:
     def __init__(self, hf_token: str, hf_repo: str):
         self.hf_token = hf_token
