@@ -5,3 +5,4 @@ tzdata
 aiohttp
 pilk
 huggingface_hub
+pillow

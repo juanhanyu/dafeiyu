@@ -1,12 +1,14 @@
 """QQ 官方机器人入口：python main.py"""
 import asyncio
 import base64
+import io
 import itertools
 import json
 import logging
 import random
 import re
 import time
+from collections import deque
 
 import aiohttp
 import botpy
@@ -46,14 +48,55 @@ def _keep_union_openid(user_cls, original_init):
 for _cls in (GroupMessage, C2CMessage):
     _keep_union_openid(_cls._User, _cls._User.__init__)
 
+# botpy 还会丢掉群消息里的昵称、@ 列表里的 bot 标记、附带的聊天记录/引用（msg_elements），把原始数据留一份
+class RawGroupMessage(GroupMessage):
+    __slots__ = ("raw",)
 
-# 群「全量模式」：后台打开「接收所有消息」后，群里每条消息都会推 GROUP_MESSAGE_CREATE。
-# botpy 不认识这个事件，这里补上，转给 on_group_message_create
+    def __init__(self, api, event_id, data):
+        super().__init__(api, event_id, data)
+        self.raw = data
+
+
+# 群 @ 事件和群「全量模式」事件都用 RawGroupMessage。全量模式（后台/群设置里开「获取群内全部消息」）下，
+# 群里每条消息都推 GROUP_MESSAGE_CREATE，@ 鱼鱼的消息也可能只走这个事件。botpy 不认识它，这里补上
+def _parse_group_at_message_create(self, payload):
+    self._dispatch("group_at_message_create", RawGroupMessage(self.api, payload.get("id", None), payload.get("d", {})))
+
+
 def _parse_group_message_create(self, payload):
-    self._dispatch("group_message_create", GroupMessage(self.api, payload.get("id", None), payload.get("d", {})))
+    self._dispatch("group_message_create", RawGroupMessage(self.api, payload.get("id", None), payload.get("d", {})))
 
 
+ConnectionState.parse_group_at_message_create = _parse_group_at_message_create
 ConnectionState.parse_group_message_create = _parse_group_message_create
+
+AT_TAG = re.compile(r"<@!?[\w-]+>|<qqbot-at-(?:user|everyone)[^>]*>")
+
+
+def mentions_bot(raw: dict) -> bool:
+    """全量模式下靠 @ 列表里的 bot 标记判断是不是在 @ 鱼鱼。"""
+    return any(m.get("bot") for m in raw.get("mentions") or [])
+
+
+def speaker_name(author: dict) -> str:
+    return (author or {}).get("username") or f"群友{((author or {}).get('member_openid') or '')[-4:]}"
+
+
+def attached_messages(raw: dict) -> list[tuple[str, str]]:
+    """消息里附带的聊天记录 / 引用 / 「@ 时附带的最近消息」都在 msg_elements 里（可以嵌套），拆成 (谁, 说了什么)。"""
+    out = []
+
+    def walk(elements, quoted):
+        for el in elements or []:
+            text = decode_faces(AT_TAG.sub("", el.get("content") or "")).strip()
+            if el.get("attachments"):
+                text = (text + " [图片]").strip()
+            if text:
+                out.append((speaker_name(el.get("author")) + ("（被引用）" if quoted else ""), text[:100]))
+            walk(el.get("msg_elements"), quoted)
+
+    walk(raw.get("msg_elements"), raw.get("message_type") == 103)
+    return out
 
 INTRO = ("大家好呀~ 我是大肥鱼，一条拟人化的 DeepSeek 鲸鱼娘🐟\n"
          "我会陪大家聊天，还会说话、唱歌、画画，最拿手的是……吃白饭！🍚\n"
@@ -92,6 +135,29 @@ def split_in_two(text: str) -> list[str]:
     return [text[:cut].strip().rstrip("，,"), text[cut:].strip()]
 
 
+STICKER_MAX_SIDE = 400   # 长宽都不超过这么大的图，多半是表情包
+VISION_MAX_SIDE = 768    # 交给看图模型前缩小，省 token
+
+
+def normalize_image(data: bytes, content_type: str) -> tuple[bytes, bool]:
+    """表情包常是 GIF/WebP 动图，看图模型不一定认，这里取中间一帧（第一帧常是空白）转成 PNG，顺便缩小。
+    返回 (PNG 数据, 看起来像不像表情包)。"""
+    from PIL import Image
+
+    im = Image.open(io.BytesIO(data))
+    animated = getattr(im, "n_frames", 1) > 1
+    if animated:
+        im.seek(im.n_frames // 2)
+    is_sticker = animated or "gif" in content_type or max(im.size) <= STICKER_MAX_SIDE
+    frame = im.convert("RGBA")
+    bg = Image.new("RGB", frame.size, (255, 255, 255))  # 透明底换成白底，模型看得清
+    bg.paste(frame, mask=frame.split()[3])
+    bg.thumbnail((VISION_MAX_SIDE, VISION_MAX_SIDE))
+    out = io.BytesIO()
+    bg.save(out, "PNG")
+    return out.getvalue(), is_sticker
+
+
 def split_text(text: str, size: int = CHUNK) -> list[str]:
     chunks = []
     while len(text) > size:
@@ -108,6 +174,8 @@ class AtreiClient(botpy.Client):
         self.cfg = cfg
         self.brain = brain
         self.http_session: aiohttp.ClientSession | None = None
+        self.seen_ids: deque = deque(maxlen=500)  # 最近处理过的消息 id，防止同一条群消息回两次
+        self.raw_logged = 0
 
     async def on_ready(self):
         log.info("「%s」上线了", self.robot.name)
@@ -123,11 +191,44 @@ class AtreiClient(botpy.Client):
         await self.api.post_c2c_message(openid=self.cfg.owner_id, msg_type=0, content=text)
 
     # ---------- 群里的普通聊天（全量模式） ----------
-    async def on_group_message_create(self, message: GroupMessage):
-        """只记下来当上下文，不回复；@ 鱼鱼的消息照旧由 on_group_at_message_create 回复。"""
-        text = decode_faces(re.sub(r"<@!?\w+>", "", message.content or "")).strip()
-        self.brain.log_group_message(message.group_openid, message.author.member_openid,
-                                     message.author.union_openid or "", text)
+    async def on_group_message_create(self, message: RawGroupMessage):
+        """全量模式：每条群消息都记进群上下文；其中 @ 了鱼鱼的要回复（这种模式下 @ 消息可能只走这个事件）。"""
+        await self._on_group(message, at_event=False)
+
+    async def on_group_at_message_create(self, message: RawGroupMessage):
+        await self._on_group(message, at_event=True)
+
+    async def _on_group(self, message: RawGroupMessage, at_event: bool):
+        """群消息统一入口。三种「群消息范围」设置都走这里：
+        仅 @ 消息（只有 @ 事件）、@ 时附带最近消息（附带的在 msg_elements 里）、全部消息（全量事件，@ 事件可能也来）。"""
+        raw = message.raw
+        if message.id in self.seen_ids:  # 同一条消息两个事件都推的话只处理一次
+            return
+        self.seen_ids.append(message.id)
+        group, author = message.group_openid, raw.get("author") or {}
+        if raw.get("msg_elements") and self.raw_logged < 5:  # 附带消息的格式文档没写清，先记几条原样的方便核对
+            self.raw_logged += 1
+            log.info("群消息附带内容（原样）：%s", json.dumps(
+                {k: raw.get(k) for k in ("message_type", "msg_elements", "message_scene")}, ensure_ascii=False)[:1500])
+        for name, text in attached_messages(raw):  # 「@ 时附带最近消息」和引用的内容，也当群上下文
+            self.brain.log_group_line(group, name, text)
+        text = decode_faces(AT_TAG.sub("", message.content or "")).strip()
+        if message.attachments:
+            text = (text + " [发了图片/表情包]").strip()
+        speaker = self.brain.group_speaker(author)
+        if not (at_event or mentions_bot(raw)):
+            self.brain.log_group_line(group, speaker, text)
+            return  # 没 @ 鱼鱼，只记录不回复
+        uid = message.author.member_openid
+        ctx = Context(user_id=uid, session_id=f"g:{group}:{uid}", target_kind="group", target_id=group,
+                      is_group=True, union_id=message.author.union_openid or "")
+        # msg_type 默认 0（文字），发表情包时传 7（富媒体）覆盖
+        reply = await self._handle(ctx, message, lambda **kw: self.api.post_group_message(
+            group_openid=group, msg_id=message.id, **{"msg_type": 0, **kw}))
+        # 回复完再记：这条 @ 消息和鱼鱼的回复都进群上下文（回复前记的话，这条会在上下文里重复一次）
+        self.brain.log_group_line(group, speaker + "（@你）", text)
+        if reply:
+            self.brain.log_group_line(group, "你（大肥鱼）", reply)
 
     # ---------- 被拉进群 ----------
     async def on_group_add_robot(self, event: GroupManageEvent):
@@ -145,15 +246,6 @@ class AtreiClient(botpy.Client):
             log.warning("进群自我介绍失败：%s", e)
 
     # ---------- 收消息 ----------
-    async def on_group_at_message_create(self, message: GroupMessage):
-        uid = message.author.member_openid
-        ctx = Context(user_id=uid, session_id=f"g:{message.group_openid}:{uid}",
-                      target_kind="group", target_id=message.group_openid, is_group=True,
-                      union_id=message.author.union_openid or "")
-        # msg_type 默认 0（文字），发表情包时传 7（富媒体）覆盖
-        await self._handle(ctx, message, lambda **kw: self.api.post_group_message(
-            group_openid=message.group_openid, msg_id=message.id, **{"msg_type": 0, **kw}))
-
     async def on_c2c_message_create(self, message: C2CMessage):
         uid = message.author.user_openid
         ctx = Context(user_id=uid, session_id=f"u:{uid}", target_kind="c2c", target_id=uid,
@@ -173,11 +265,13 @@ class AtreiClient(botpy.Client):
         await self._handle(ctx, message, lambda **kw: message.reply(**kw))
 
     async def _handle(self, ctx: Context, message, send):
-        raw = re.sub(r"<@!?\d+>", "", message.content or "").strip()
+        raw = AT_TAG.sub("", message.content or "").strip()
         if "<faceType" in raw:  # 记下 QQ 表情的原始格式，方便研究怎么发
             log.info("收到 QQ 表情原文：%s", raw[:300])
         text = decode_faces(raw)
-        images = await self._download_images(message.attachments)
+        images, stickers = await self._download_images(message.attachments, sticker_hint="faceType=6" in raw)
+        if stickers:  # 告诉鱼鱼对方发的是表情包，让她像朋友斗图那样接梗，而不是一本正经描述图片
+            text = (text + f"\n[对方发了{'一个' if stickers == 1 else f'{stickers}个'}表情包]").strip()
         log.info("[%s] %s%s%s", ctx.session_id, text[:60], f" +{len(images)}图" if images else "",
                  "" if ctx.union_id else "（无 union_openid）")
         # 同一条消息的多次回复要用递增的 msg_seq。每条消息各用各的计数器：
@@ -205,6 +299,7 @@ class AtreiClient(botpy.Client):
                 log.warning("表情包 %s 发送失败：%s", sticker["id"], e)
         for prompt in ctx.drawings:
             await self._send_drawing(ctx, message, send, prompt)
+        return reply
 
     async def _send_text(self, ctx: Context, send, text: str):
         """带 [可爱] 这类 QQ 表情的回复用 Markdown 发（黄脸是行内小图），失败或频道里就去掉表情发文字。"""
@@ -281,8 +376,9 @@ class AtreiClient(botpy.Client):
             if "url" in str(e).lower() or "链接" in str(e):
                 await send(content=re.sub(r"https?://\S+|\b\w+\.(com|cn|net|org)\S*", "[链接已隐藏]", content))
 
-    async def _download_images(self, attachments) -> list[tuple[str, bytes]]:
-        images = []
+    async def _download_images(self, attachments, sticker_hint: bool = False) -> tuple[list[tuple[str, bytes]], int]:
+        """下载图片并统一成看图模型吃得下的静态 PNG；返回 (图片, 其中几张像表情包)。"""
+        images, stickers = [], 0
         for a in attachments or []:
             if not (a.content_type or "").startswith("image") or not a.url:
                 continue
@@ -290,11 +386,12 @@ class AtreiClient(botpy.Client):
             try:
                 async with self.http_session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
                     data = await r.read()
-                mime = a.content_type if "/" in a.content_type else "image/png"
-                images.append((mime, data))
+                png, is_sticker = await asyncio.to_thread(normalize_image, data, a.content_type or "")
+                images.append(("image/png", png))
+                stickers += is_sticker or sticker_hint
             except Exception as e:
-                log.warning("图片下载失败：%s", e)
-        return images
+                log.warning("图片下载/处理失败：%s", e)
+        return images, stickers
 
 async def main():
     handler = logging.StreamHandler()

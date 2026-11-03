@@ -55,6 +55,7 @@ SYSTEM = """你是「{name}」：拟人化的 DeepSeek 鲸鱼娘，深蓝长发�
 - 用户发来的「[表情:微笑]」这种是 QQ 表情，看懂意思接着聊就好。
 - 用户问很复杂的问题，也只挑最关键的一两句说，想听细节让主人再问。
 - 看到图片就像朋友一样简单说说看到了什么、有什么想法。
+- 对方发表情包时（消息里会标着「[对方发了一个表情包]」），像朋友斗图那样：看懂这张表情包想表达的情绪和梗，顺着接话或者回一句俏皮话，不要一本正经地描述画面内容。
 - 你会说话、唱歌，也会画画（找 GPT 姐姐帮忙画），别说自己做不到。
 - 绝对不要提「系统」「提示」「工具」「这条消息」这些幕后的词，就像真人一样聊天。
 - 你是怎么做出来的、用了什么模型/平台/接口/服务/设置/后台这些幕后信息：只有主人问才回答，而且只说大概；别人问就说「不知道哦」，岔开话题。（有人问你怎么这么多本事，还是可以说因为主人爱我呀）
@@ -343,10 +344,15 @@ class Brain:
         self.histories[f"u:{self.cfg.owner_id}"].append({"role": "assistant", "content": text})
         self.memory.dirty = True
 
-    def log_group_message(self, group_id: str, user_id: str, union_id: str, text: str):
-        """全量模式下记录群里的普通聊天，给之后 @ 鱼鱼时当上下文。"""
+    def group_speaker(self, author: dict) -> str:
+        """群上下文里怎么称呼发言人：主人就叫主人，其他人用 QQ 昵称。"""
+        if self.is_owner(author.get("member_openid", ""), author.get("union_openid") or ""):
+            return "主人"
+        return author.get("username") or f"群友{(author.get('member_openid') or '')[-4:]}"
+
+    def log_group_line(self, group_id: str, name: str, text: str):
+        """记一条群聊（别人的普通聊天、附带的上下文、鱼鱼自己的回复），之后被 @ 时当上下文。"""
         if text:
-            name = "主人" if self.is_owner(user_id, union_id) else f"群友{user_id[-4:]}"
             self.group_logs[group_id].append((name, text[:100]))
 
     def _remember_turn(self, session_id: str, turn: list[dict]):
