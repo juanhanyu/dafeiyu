@@ -1,4 +1,4 @@
-"""联网搜索（Tavily）：平时不搜，遇到不懂又关键的信息才查。没配置 TAVILY_API_KEY 时自动关闭。"""
+"""联网搜索（Tavily）：拿不准就查，查了也不说。画图前由代码强制查一次外貌。没配置 TAVILY_API_KEY 时自动关闭。"""
 import aiohttp
 
 API = "https://api.tavily.com/search"
@@ -7,9 +7,10 @@ SEARCH_TOOL = {
     "type": "function",
     "function": {
         "name": "web_search",
-        "description": "上网查资料。一般不用！只有遇到你不知道、又对回答很关键的信息才用："
-                       "最近的新闻和事件、具体的人/作品/游戏/梗、比赛结果、价格、天气这类你不确定或可能过时的事实。"
-                       "闲聊、常识、讲道理、你本来就知道的东西都不要搜。",
+        "description": "上网查资料。拿不准就查，别靠猜：对方提到的具体角色、人物、作品、游戏、番剧、歌、品牌、梗、"
+                       "黑话，只要你不是很确定它是什么，就先查；最近的新闻和事件、比赛结果、价格、天气、版本更新这类"
+                       "可能过时的事实也要查。纯闲聊、撒娇、常识、讲道理不用查。"
+                       "查的时候别说出来，也不用提前说「我查一下」，直接调用。",
         "parameters": {
             "type": "object",
             "properties": {"query": {"type": "string", "description": "搜索关键词，简短明确"}},
@@ -40,5 +41,22 @@ class WebSearch:
             "answer": data.get("answer"),
             "results": [{"title": x.get("title"), "content": (x.get("content") or "")[:300]}
                         for x in data.get("results", [])[:5]],
-            "note": "照这些资料用你自己的口吻简短回答；资料里没有就说不确定，不要编；不要贴网址。",
+            "note": "当作你本来就知道的事，用自己的口吻简短回答；绝对不要说「我查到」「搜到」「网上说」「资料显示」这类话，"
+                    "也不要提查过资料；资料里没有就说不太确定，不要编；不要贴网址。",
+        }
+
+    async def research_subject(self, subject: str) -> dict:
+        """画图前查角色/对象的长相和性格。这里要细节，所以查得更深，每条也留得更长。"""
+        payload = {"query": f"{subject} 角色设定 外貌 发色 发型 瞳色 服装 配饰 性格", "max_results": 5,
+                   "include_answer": "advanced", "search_depth": "advanced"}
+        async with aiohttp.ClientSession() as s:
+            async with s.post(API, json=payload, headers={"Authorization": f"Bearer {self.api_key}"},
+                              timeout=aiohttp.ClientTimeout(total=45)) as r:
+                if r.status != 200:
+                    raise RuntimeError(f"搜索失败 {r.status}")
+                data = await r.json()
+        return {
+            "answer": data.get("answer"),
+            "results": [{"title": x.get("title"), "content": (x.get("content") or "")[:800]}
+                        for x in data.get("results", [])[:5]],
         }

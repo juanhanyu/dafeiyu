@@ -28,6 +28,8 @@ class Context:
     sing: bool = False   # 本轮语音是唱歌
     drawings: list[str] = field(default_factory=list)  # 本轮要画的图（画面描述）
     optional: bool = False  # 没人叫她，是她自己想接话：可以选择不说
+    researched: bool = False  # 这轮画图前的资料已经查过了
+    pending_prompt: str = ""  # 查资料时她第一次写的画面描述（万一她查完忘了画，就照这个画）
 
 
 class StickerLibrary:
@@ -75,12 +77,15 @@ IMAGE_TOOL = {
     "type": "function",
     "function": {
         "name": "generate_image",
-        "description": "给主人画一张图（会在你的文字后面发出去，要等一会儿）。一次回复最多画一张。",
+        "description": "画一张图（会在你的文字后面发出去，要等一会儿）。一次回复最多画一张。"
+                       "第一次调用时系统会先把要画的对象的资料交给你，你照资料重写 prompt 后再调用一次才真正开画。",
         "parameters": {
             "type": "object",
             "properties": {"prompt": {"type": "string", "description": "详细的画面描述：主体、动作、场景、风格、构图、光线。"
-                                      "画你自己时写清楚长相：Q版拟人鲸鱼娘，深蓝长发、头顶一根呆毛、女仆头饰、蓝眼睛"}},
-            "required": ["prompt"],
+                                      "画你自己时写清楚长相：Q版拟人鲸鱼娘，深蓝长发、头顶一根呆毛、女仆头饰、蓝眼睛"},
+                           "subject": {"type": "string", "description": "要画的对象，尽量写全，比如「千夏 绝区零」。"
+                                       "角色、真实人物、作品、品牌、地标都写上；一张图有好几个就用空格隔开。画你自己就写「大肥鱼」。"}},
+            "required": ["prompt", "subject"],
         },
     },
 }
@@ -118,11 +123,11 @@ class ToolBox:
             result = {"error": f"{type(e).__name__}: {e}"}
         return json.dumps(result, ensure_ascii=False, default=str)
 
-    def t_generate_image(self, ctx, prompt):
+    def t_generate_image(self, ctx, prompt, subject=""):
         if ctx.drawings:
             return {"error": "这次已经画了一张了"}
         ctx.drawings.append(prompt)
-        return {"ok": True, "note": "已开始画，图会在你的文字后面发出去。跟主人说一句马上画好之类的话就行，不要描述画面细节。"}
+        return {"ok": True, "note": "已开始画，图会在你的文字后面发出去。跟对方说一句马上画好之类的话就行，不要描述画面细节，也不要提查过资料。"}
 
     def t_send_sticker(self, ctx, emotion, keywords=""):
         if ctx.stickers:

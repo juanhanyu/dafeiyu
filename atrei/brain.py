@@ -25,8 +25,13 @@ log = logging.getLogger("atrei")
 
 GROUP_CONTEXT = 30  # 群里记最近这么多条聊天（全量模式下群聊多，12 条一下就刷没了）
 GROUP_CONTEXT_MAX_AGE = 3 * 3600  # 超过这么久的群聊不算「刚才」，不拿给她看
-MAX_TOOL_ROUNDS = 4  # 查资料 → 回答 → 配表情包，最多来回几次
+MAX_TOOL_ROUNDS = 6  # 查资料 → 回答 → 配表情包，画图还要多一轮查外貌，最多来回几次
 FACE_CHANCE = 0.4  # 大约四成消息带一个 QQ 小黄脸
+# 画她自己不用查；别的一律先查
+DRAW_SELF = re.compile(r"^\s*(?:大肥鱼|肥鱼|鱼鱼|本鱼|自己|我自己)\s*~?\s*$")
+# 查过资料也要当作本来就知道：这种话万一说出来，整小句去掉
+SEARCH_TALK = re.compile(r"查到|搜到|搜了|查了|查过|搜过|搜索|查一下|搜一下|网上(?:说|写|查|看)|资料(?:显示|说|上|里|写)|百度|维基")
+CLAUSE = re.compile(r"(?<=[，,。！!？?~～…；;\n])")
 SILENT = "不说话"  # 没人叫她时，模型回这个就是决定不接话
 
 HELP = "咕噜~ 本鱼就是陪你聊天的，想说啥直接说，发图片也行~\n/清空 可以让鱼鱼忘掉刚才聊的"
@@ -235,6 +240,35 @@ class Brain:
             parts.append({"type": "image_url", "image_url": {"url": url}})
         return {"role": "user", "content": parts}
 
+    async def _research_for_drawing(self, ctx: Context, args: dict, asked: str) -> dict | None:
+        """画图前强制查资料（第一次调用 generate_image 时由代码做，模型绕不过去）。
+        返回给模型的资料；不用查或查不到时返回 None，照常开画。"""
+        if ctx.researched or not self.search.enabled:
+            return None
+        ctx.researched = True
+        ctx.pending_prompt = args.get("prompt", "")
+        subject = (args.get("subject") or "").strip() or asked[:60] or ctx.pending_prompt[:60]
+        if DRAW_SELF.match(subject):
+            return None
+        try:
+            found = await self.search.research_subject(subject)
+        except Exception as e:  # 查不到也别耽误画图
+            log.warning("画图前查资料失败（%s）：%s", subject, e)
+            return None
+        log.info("画图前查了资料：%s", subject)
+        return {**found, "note": (
+            f"图还没开始画。以上是「{subject}」的资料。现在重新调用 generate_image 才会开画：把资料里的外貌特征"
+            "（发色、发型、瞳色、服装、配饰、标志物）和性格气质写进 prompt，并保留角色名和作品名；"
+            "资料里没写到的特征不要猜，也别写成别的样子。和对方说话时绝对不要提查过资料，当作你本来就认识。")}
+
+    @staticmethod
+    def _hide_search_talk(reply: str) -> str:
+        """去掉「我查到了……」这类小句；全被去掉时留一句普通的话。"""
+        if not SEARCH_TALK.search(reply):
+            return reply
+        kept = "".join(c for c in CLAUSE.split(reply) if not SEARCH_TALK.search(c)).strip()
+        return kept or "嗯嗯~"
+
     async def _chat(self, ctx: Context, text: str, images: list[tuple[str, bytes]]) -> str:
         history = self.histories[ctx.session_id]
         user_msg = self._user_message(text, images)
@@ -256,16 +290,18 @@ class Brain:
             if left > 0:
                 tools.append(IMAGE_TOOL)
             if self.imagegen.offered(ctx.user_id, text):
-                messages[0]["content"] += ("\n- 对方可能想看图：要是想要一张新画的图（比如你在干什么的样子、某个场景），就用 generate_image 画；只是要表情包就别画。别提还能画几张。" if left > 0
+                messages[0]["content"] += ("\n- 对方可能想看图：要是想要一张新画的图（比如你在干什么的样子、某个场景），就用 generate_image 画；只是要表情包就别画。别提还能画几张。不认识要画的角色也直接调用，系统会把资料给你，不要说不认识。" if left > 0
                                            else "\n- 对方想让你画画，但今天画不了了：要说「本鱼今天已经没脸找GPT姐姐画画啦~」，可以再撒个娇。")
             elif left > 0:
                 messages[0]["content"] += "\n- 要是对方发的是一段画面描述、想让你照着画，就用 generate_image 画。说了要画就一定要调用它，不能光嘴上答应。"
         if self.search.enabled:  # 搜索工具一直给，但描述里写明一般不用，只在不懂又关键时才查
             tools.append(SEARCH_TOOL)
+            messages[0]["content"] += "\n- 拿不准的具体事物先用 web_search 查，别猜。查过的东西当作你本来就知道，不要说「我查到」「网上说」这类话。"
         tool_args = {"tools": tools} if tools else {}
 
         reply = ""
         said = []  # 模型在调用工具前顺带说的话，也要发出去
+        used_search = False  # 这轮查过资料，回复里不能说漏嘴
         for _ in range(MAX_TOOL_ROUNDS):
             resp = await self.client.chat.completions.create(
                 model=self.cfg.llm_model,
@@ -298,9 +334,15 @@ class Brain:
                     args = json.loads(call.function.arguments or "{}")
                 except json.JSONDecodeError:
                     args = {}
+                research = None
+                if call.function.name == "generate_image":
+                    research = await self._research_for_drawing(ctx, args, text)
                 if call.function.name == "web_search":
-                    searched = True
+                    searched = used_search = True
                     result = json.dumps(await self.search.search(args.get("query", "")), ensure_ascii=False)
+                elif research is not None:  # 资料先给她，还没开画：她要接着重写 prompt 再调用一次
+                    searched = used_search = True
+                    result = json.dumps(research, ensure_ascii=False)
                 else:
                     result = self.tools.run(ctx, call.function.name, args)
                 log.info("tool %s(%s) -> %s", call.function.name, args, result[:200])
@@ -312,6 +354,10 @@ class Brain:
         else:
             reply = "咕噜~"
 
+        if ctx.pending_prompt and not ctx.drawings:  # 查完资料她忘了再调用：说了要画就得画
+            ctx.drawings.append(ctx.pending_prompt)
+        if used_search:
+            reply = self._hide_search_talk(reply)
         if ctx.optional and (not reply or SILENT in reply):  # 她决定不接话：什么都不发，也不记进对话
             ctx.stickers.clear()
             ctx.drawings.clear()
