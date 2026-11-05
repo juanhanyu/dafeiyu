@@ -27,6 +27,7 @@ GROUP_CONTEXT = 30  # 群里记最近这么多条聊天（全量模式下群聊�
 GROUP_CONTEXT_MAX_AGE = 3 * 3600  # 超过这么久的群聊不算「刚才」，不拿给她看
 MAX_TOOL_ROUNDS = 4  # 查资料 → 回答 → 配表情包，最多来回几次
 FACE_CHANCE = 0.4  # 大约四成消息带一个 QQ 小黄脸
+SILENT = "不说话"  # 没人叫她时，模型回这个就是决定不接话
 
 HELP = "咕噜~ 本鱼就是陪你聊天的，想说啥直接说，发图片也行~\n/清空 可以让鱼鱼忘掉刚才聊的"
 
@@ -88,6 +89,7 @@ class Brain:
         self.life = Life(self.meta, cfg.tz)
         # 群里最近的聊天（全量模式下才有），给 @ 鱼鱼时当上下文：group_openid -> [(谁, 说了什么)]
         self.group_logs: dict[str, deque] = defaultdict(lambda: deque(maxlen=GROUP_CONTEXT))
+        self.group_heard: dict[str, float] = {}  # 每个群最后一次有人说话的时间（精确到秒，不存档）
         self.bind_code: tuple[str, float] | None = None  # /认主 的临时口令和过期时间
         self.bind_tries = 0
         self._secrets = [v for v in (cfg.llm_api_key, cfg.breeze_api_key, cfg.hf_token, cfg.qq_secret, cfg.tavily_api_key) if v and len(v) >= 8]
@@ -113,7 +115,7 @@ class Brain:
                         reply = await self._chat(ctx, text, images)
                     except Exception as e:
                         log.exception("LLM 调用失败")
-                        reply = "咕噜…鱼鱼脑子卡住了，等下再试试~"
+                        reply = "" if ctx.optional else "咕噜…鱼鱼脑子卡住了，等下再试试~"
         return reply
 
     async def load_memory(self):
@@ -195,7 +197,8 @@ class Brain:
             cutoff = time.time() - GROUP_CONTEXT_MAX_AGE
             recent = [(n, t) for n, t, at in self.group_logs.get(ctx.target_id, ()) if at > cutoff]
             if recent:
-                who += ("\n群里刚才在聊（你是被叫到了才开口的，可以顺着话题接；别人之间的对话不用逐条回应）：\n"
+                who += ("\n群里刚才在聊" + ("" if ctx.optional else "（你是被叫到了才开口的，可以顺着话题接；别人之间的对话不用逐条回应）")
+                        + "：\n"
                         + "\n".join(f"{n}：{t}" for n, t in recent))
         who += "\n" + self.life.state(owner)
         who += self.longterm.prompt_block(person_key(owner, ctx.user_id))
@@ -243,7 +246,10 @@ class Brain:
         face_ok = random.random() < FACE_CHANCE  # 小黄脸也由代码控制频率
         messages = [{"role": "system", "content": self._system_prompt(ctx, sticker_ok, ctx.voice, face_ok)}, *history, user_msg]
         tools = list(self.tool_schemas) if sticker_ok else []
-        if self.imagegen.enabled:
+        if ctx.optional:
+            messages[0]["content"] += (f"\n- 这条消息没有 @ 你，不一定是对你说的，是你在群里看到了。想接话就像群友一样随口接一句；"
+                                       f"人家在跟别人聊、或者你没什么想说的，就只回「{SILENT}」三个字，不要解释。")
+        if self.imagegen.enabled and (not ctx.optional or self.imagegen.offered(ctx.user_id, text)):
             # 画画工具只要还有额度就一直给：别人常常只发一段画面描述（「Hello Kitty 做成果冻软糖，微距摄影」），
             # 不带「画」「图」字，以前没给工具，她嘴上答应画却画不出来
             left = self.imagegen.quota_left()
@@ -306,6 +312,11 @@ class Brain:
         else:
             reply = "咕噜~"
 
+        if ctx.optional and (not reply or SILENT in reply):  # 她决定不接话：什么都不发，也不记进对话
+            ctx.stickers.clear()
+            ctx.drawings.clear()
+            ctx.voice = False
+            return ""
         # 模型偶尔会学着写「[发了表情包：…]」这种旁白，去掉
         reply = re.sub(r"\n*[\[【（(]发了?(?:一张|个)?表情包[^\]】）)]*[\]】）)]", "", reply or "").strip()
         if not face_ok:
@@ -346,6 +357,36 @@ class Brain:
         for secret in self._secrets:
             text = text.replace(secret, "***")
         return text
+
+    async def group_proactive_message(self, group_id: str, reason: str) -> str:
+        """写一条主动发到群里的话（没有回复谁）。"""
+        ctx = Context("", f"g:{group_id}:proactive", "group", group_id, is_group=True, optional=True)
+        nudge = (f"（这条不是谁发的，是你自己想在群里说句话。原因：{reason}。"
+                 "像群友随口冒泡那样只写一句话，群里刚才有话题可以顺着聊。别 @ 人，别提「主动」「系统」这类词，也别提主人。）")
+        messages = [{"role": "system", "content": self._system_prompt(ctx, False, False, False)},
+                    {"role": "user", "content": nudge}]
+        try:
+            resp = await self.client.chat.completions.create(
+                model=self.cfg.llm_model, messages=messages, max_tokens=self.cfg.llm_max_tokens, **self._thinking_args())
+        except Exception:
+            log.exception("群主动消息生成失败")
+            return ""
+        text = FACE_TOKEN.sub("", (resp.choices[0].message.content or "").strip()).strip()
+        for secret in self._secrets:
+            text = text.replace(secret, "***")
+        return text
+
+    def note_group_activity(self, group_id: str):
+        """记下群里有人说话。存档只按小时更新，免得群聊一热闹就每分钟写一次存档。"""
+        now = time.time()
+        self.group_heard[group_id] = now
+        active = self.meta.setdefault("group_active", {})
+        if now - active.get(group_id, 0) > 3600:
+            active[group_id] = now
+            self.memory.dirty = True
+
+    def group_last_heard(self, group_id: str) -> float:
+        return self.group_heard.get(group_id) or self.meta.get("group_active", {}).get(group_id, 0)
 
     def remember_proactive(self, text: str):
         """主动发的话也记进跟主人的私聊记忆，主人回复时鱼鱼知道自己刚说了什么。"""

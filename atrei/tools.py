@@ -27,6 +27,7 @@ class Context:
     voice: bool = False  # 本轮回复要念成语音发
     sing: bool = False   # 本轮语音是唱歌
     drawings: list[str] = field(default_factory=list)  # 本轮要画的图（画面描述）
+    optional: bool = False  # 没人叫她，是她自己想接话：可以选择不说
 
 
 class StickerLibrary:

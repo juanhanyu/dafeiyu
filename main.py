@@ -5,10 +5,12 @@ import io
 import itertools
 import json
 import logging
+import os
 import random
 import re
 import time
 from collections import deque
+from datetime import datetime
 
 import aiohttp
 import botpy
@@ -19,7 +21,8 @@ from botpy.message import C2CMessage, DirectMessage, GroupMessage, Message
 
 from atrei import config, faces, hf
 from atrei.brain import Brain
-from atrei.proactive import Proactive
+from atrei.groupchat import GroupPace
+from atrei.proactive import GroupProactive, Proactive
 from atrei.memory import ArchiveLogHandler
 from atrei.tools import Context
 
@@ -283,6 +286,7 @@ class AtreiClient(botpy.Client):
         self.logged_ids: deque = deque(maxlen=2000)  # 已经记进群上下文的消息（没回复），@ 事件后到时还能回
         self.my_group_ids: dict[str, set[str]] = {}  # 鱼鱼在每个群里的编号（被 @ 时学到）
         self.full_groups: set[str] = set()  # 这次启动以来收到过全量事件的群
+        self.pace = GroupPace()  # 没人 @ 时要不要自己接话
         self.group_images: dict[str, deque] = {}  # 群里最近发过的图片链接
         self.raw_logged = 0
 
@@ -295,12 +299,18 @@ class AtreiClient(botpy.Client):
             archive = ArchiveLogHandler(self.brain.meta, self.brain.memory)
             log.addHandler(archive)
             logging.getLogger("botpy").addHandler(archive)  # botpy 的连接/报错日志也存一份
+            log.info("启动完成，版本 %s", (os.getenv("RENDER_GIT_COMMIT") or "本地")[:7])  # 存档日志里能看出线上跑的是哪一版
             self.memory_task = asyncio.create_task(self.brain.memory.run_forever(self.brain.histories, self.brain.meta))
             self.proactive_task = asyncio.create_task(Proactive(self.brain, self.send_to_owner).run_forever())
+            self.group_proactive_task = asyncio.create_task(GroupProactive(self.brain, self.send_to_group).run_forever())
 
     async def send_to_owner(self, text: str):
         """主动给主人发私聊（不回复任何消息，占用 QQ 的主动消息额度）。"""
         await self.api.post_c2c_message(openid=self.cfg.owner_id, msg_type=0, content=text)
+
+    async def send_to_group(self, group: str, text: str):
+        """主动往群里发（不回复任何消息）。"""
+        await self.api.post_group_message(group_openid=group, msg_type=0, content=text)
 
     # ---------- 群里的普通聊天（全量模式） ----------
     async def on_group_message_create(self, message: RawGroupMessage):
@@ -392,28 +402,43 @@ class AtreiClient(botpy.Client):
         to_me = (at_event or mentions_me(raw, my_ids) or bool(NAME_CALL.match(plain or spoken))
                  or self._quotes_me(raw, group))
         self._sample_group_event(raw, "at_event" if at_event else "full_to_me" if to_me else "full_plain")
+        if not author.get("bot"):
+            self.brain.note_group_activity(group)
+        uid = message.author.member_openid
+        optional = False
         if author.get("bot") or not to_me:  # 别的机器人说的话只听不回，免得两个机器人没完没了
             if first_time:
                 self.logged_ids.append(message.id)
                 self.brain.log_group_line(group, speaker, text)
                 self.remember_group_images(group, own_atts)
-            return
+            now = datetime.now(self.cfg.tz)
+            if author.get("bot") or not first_time or not self.pace.should_chime(
+                    group, uid, plain or spoken or text, now.hour + now.minute / 60):
+                return
+            optional = True  # 没人叫她，但她想接话
+            self.pace.busy.add(group)
         self.seen_ids.extend((message.id, print_id))
         # @ 鱼鱼时自己没带图、又提到图/表情包（「看看上文表情包」），就把群里最近的几张拿来看
         if not own_atts and LOOK_BACK.search(text):
             message.context_images = list(self.group_images.get(group, []))[-LOOK_BACK_MAX:]
         message.content = " ".join(x for x in (rendered.strip(), spoken) if x)
-        uid = message.author.member_openid
         ctx = Context(user_id=uid, session_id=f"g:{group}:{uid}", target_kind="group", target_id=group,
-                      is_group=True, union_id=message.author.union_openid or "")
-        # msg_type 默认 0（文字），发表情包时传 7（富媒体）覆盖
-        reply = await self._handle(ctx, message, lambda **kw: self.api.post_group_message(
-            group_openid=group, msg_id=message.id, **{"msg_type": 0, **kw}))
-        # 回复完再记：这条 @ 消息和鱼鱼的回复都进群上下文（回复前记的话，这条会在上下文里重复一次）
-        self.brain.log_group_line(group, speaker + "（@你）", text)
-        self.remember_group_images(group, own_atts)
+                      is_group=True, union_id=message.author.union_openid or "", optional=optional)
+        try:
+            # msg_type 默认 0（文字），发表情包时传 7（富媒体）覆盖
+            reply = await self._handle(ctx, message, lambda **kw: self.api.post_group_message(
+                group_openid=group, msg_id=message.id, **{"msg_type": 0, **kw}))
+        finally:
+            self.pace.busy.discard(group)
+        if not optional:  # 回复完再记：这条 @ 消息和鱼鱼的回复都进群上下文（回复前记的话，这条会在上下文里重复一次）
+            self.brain.log_group_line(group, speaker + "（@你）", text)
+            self.remember_group_images(group, own_atts)
         if reply:
             self.brain.log_group_line(group, "你（大肥鱼）", reply)
+            self.pace.note_reply(group, uid)
+            if optional:
+                self.pace.note_unprompted(group)
+                log.info("没人 @ 也接话了：%s", reply[:40])
 
     def remember_group_images(self, group: str, atts: list[dict]):
         """记住群里最近发过的图片链接（不下载），有人 @ 鱼鱼说「看看上面的图」时再拿出来看。"""
@@ -436,6 +461,26 @@ class AtreiClient(botpy.Client):
             log.info("在新群 %s 自我介绍了", event.group_openid)
         except Exception as e:
             log.warning("进群自我介绍失败：%s", e)
+
+    async def on_group_del_robot(self, event: GroupManageEvent):
+        """被移出群：不再往这个群主动发消息。"""
+        self.brain.meta.get("group_active", {}).pop(event.group_openid, None)
+        self.brain.memory.dirty = True
+
+    async def on_group_msg_reject(self, event: GroupManageEvent):
+        """群里关掉了机器人的主动消息：遵守，不再发。"""
+        rejected = self.brain.meta.setdefault("group_rejected", [])
+        if event.group_openid not in rejected:
+            rejected.append(event.group_openid)
+            self.brain.memory.dirty = True
+        log.info("群 %s 关闭了主动消息", event.group_openid)
+
+    async def on_group_msg_receive(self, event: GroupManageEvent):
+        rejected = self.brain.meta.setdefault("group_rejected", [])
+        if event.group_openid in rejected:
+            rejected.remove(event.group_openid)
+            self.brain.memory.dirty = True
+        log.info("群 %s 打开了主动消息", event.group_openid)
 
     # ---------- 收消息 ----------
     async def on_c2c_message_create(self, message: C2CMessage):
@@ -481,6 +526,8 @@ class AtreiClient(botpy.Client):
             return await reply_to(msg_seq=next(seq), **kw)
 
         reply = await self.brain.handle(ctx, text, images)
+        if ctx.optional and not reply:  # 她想了想，决定不接话
+            return ""
         if not (ctx.voice and await self._send_voice(ctx, message, send, reply)):
             reply = faces.strip_unknown(reply)
             parts = split_in_two(reply) if ctx.target_kind == "group" and random.random() < SPLIT_CHANCE else [reply]
