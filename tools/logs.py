@@ -26,6 +26,10 @@ def main():
     if args[:1] == ["--samples"]:
         for s in meta.get("raw_samples", []) or ["（还没有样本）"]:
             print(json.dumps(s, ensure_ascii=False, indent=1))
+        for kind, samples in meta.get("group_samples", {}).items():  # at_event / full_to_me / full_plain
+            print(f"===== {kind} =====")
+            for s in samples:
+                print(json.dumps(s, ensure_ascii=False, indent=1))
         return
     lines = meta.get("logs", [])
     if args:

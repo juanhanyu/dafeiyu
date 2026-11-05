@@ -75,9 +75,61 @@ ConnectionState.parse_group_message_create = _parse_group_message_create
 AT_TAG = re.compile(r"<@!?[\w-]+>|<qqbot-at-(?:user|everyone)[^>]*>")
 
 
-def mentions_bot(raw: dict) -> bool:
-    """全量模式下靠 @ 列表里的 bot 标记判断是不是在 @ 鱼鱼。"""
-    return any(m.get("bot") for m in raw.get("mentions") or [])
+AT_ID = re.compile(r"<@!?([\w-]+)>")
+# 全量模式下不 @ 也听得见：一开口就叫她名字的，也算在跟她说话
+NAME_CALL = re.compile(r"^\s*(?:大肥鱼|肥鱼|鱼鱼)")
+
+
+def at_ids_of(mention: dict) -> set[str]:
+    return {mention[k] for k in ("id", "member_openid", "user_openid") if mention.get(k)}
+
+
+def mentions_me(raw: dict, my_ids: set[str]) -> bool:
+    """这条是不是在 @ 鱼鱼。mentions 实际有 is_you（官方文档没写，NoneBot 适配器在用）。
+    bot 标记不能单独当依据：群友 @ 别的机器人时也是 true；@全体（scope=all）的 is_you 恒为 true，不算叫她。
+    mentions 有时是空的，再看正文的 <@编号> 是不是她在这个群的编号（之前被 @ 时记下来的）。"""
+    for m in raw.get("mentions") or []:
+        if m.get("scope") == "all":
+            continue
+        if m.get("is_you") or ("is_you" not in m and m.get("bot")) or at_ids_of(m) & my_ids:
+            return True
+    return bool(set(AT_ID.findall(raw.get("content") or "")) & my_ids)
+
+
+def render_ats(content: str, mentions: list[dict], my_ids: set[str]) -> str:
+    """去掉 @ 鱼鱼的标记；@ 别人的换成 @昵称，这样她看得出这句话是对谁说的。"""
+    people = {k: m for m in mentions or [] for k in at_ids_of(m)}
+
+    def repl(tag):
+        who = tag.group(1)
+        if who == "all":
+            return "@全体成员 "
+        m = people.get(who)
+        if who in my_ids or not m or m.get("is_you"):
+            return ""
+        return f"@{m['username']} " if m.get("username") else ""
+    return re.sub(r" {2,}", " ", AT_TAG.sub("", AT_ID.sub(repl, content or "")))
+
+
+def voice_text(raw: dict) -> str:
+    """语音消息 QQ 会附一份语音转文字（asr_refer_text）。"""
+    return " ".join(a["asr_refer_text"] for a in raw.get("attachments") or [] if a.get("asr_refer_text"))
+
+
+def media_note(raw: dict) -> str:
+    """除图片外的附件和卡片，写成一个标记进群上下文。"""
+    notes = []
+    for a in raw.get("attachments") or []:
+        kind = a.get("content_type") or ""
+        if kind.startswith(("voice", "audio")):
+            notes.append(f"[语音] {a.get('asr_refer_text') or ''}".strip())
+        elif kind.startswith("video"):
+            notes.append("[发了视频]")
+        elif kind == "file":
+            notes.append(f"[发了文件 {a.get('filename') or ''}]".replace(" ]", "]"))
+    if raw.get("message_type") == 3:
+        notes.append("[发了卡片消息]")
+    return " ".join(notes)
 
 
 def speaker_name(author: dict) -> str:
@@ -143,8 +195,9 @@ def attached_messages(raw: dict, current: str = "") -> list[tuple[str | None, st
                 atts = [{"url": a.get("url"), "sticker": "gif" in (a.get("content_type") or "")}
                         for a in el.get("attachments") or [] if (a.get("content_type") or "").startswith("image")]
                 text = _label(_clean_attached(content), atts)
-                if text:
-                    out.append((speaker_name(el.get("author")) + ("（被引用）" if quoted else ""), text[:100], atts))
+                if text and (quoted or _clean_attached(content) != _clean_attached(current)):  # 全量消息常带一份自己的副本
+                    name = speaker_name(el["author"]) + ("（被引用）" if quoted else "") if el.get("author") else None
+                    out.append((name, text[:100], atts))
             walk(el.get("msg_elements"), quoted)
 
     walk(raw.get("msg_elements"), raw.get("message_type") == 103)
@@ -226,7 +279,10 @@ class AtreiClient(botpy.Client):
         self.cfg = cfg
         self.brain = brain
         self.http_session: aiohttp.ClientSession | None = None
-        self.seen_ids: deque = deque(maxlen=500)  # 最近处理过的消息 id，防止同一条群消息回两次
+        self.seen_ids: deque = deque(maxlen=1000)  # 已经回复过的消息，防止同一条群消息回两次
+        self.logged_ids: deque = deque(maxlen=2000)  # 已经记进群上下文的消息（没回复），@ 事件后到时还能回
+        self.my_group_ids: dict[str, set[str]] = {}  # 鱼鱼在每个群里的编号（被 @ 时学到）
+        self.full_groups: set[str] = set()  # 这次启动以来收到过全量事件的群
         self.group_images: dict[str, deque] = {}  # 群里最近发过的图片链接
         self.raw_logged = 0
 
@@ -254,36 +310,99 @@ class AtreiClient(botpy.Client):
     async def on_group_at_message_create(self, message: RawGroupMessage):
         await self._on_group(message, at_event=True)
 
+    def _my_name(self) -> str:
+        return (self.robot.name if self.robot else "") or self.cfg.bot_name
+
+    def _my_ids(self, group: str) -> set[str]:
+        return self.my_group_ids.setdefault(group, {self.robot.id} if self.robot and self.robot.id else set())
+
+    def _learn_my_ids(self, group: str, raw: dict, at_event: bool):
+        """记下鱼鱼在这个群的编号，以后 mentions 为空时靠正文里的 <@编号> 也能认出来。"""
+        ids = self._my_ids(group)
+        mentions = raw.get("mentions") or []
+        for m in mentions:
+            if m.get("scope") != "all" and m.get("is_you"):
+                ids |= at_ids_of(m)
+        tags = set(AT_ID.findall(raw.get("content") or "")) - {"all"}
+        if at_event and not mentions and len(tags) == 1:  # @ 事件里只有一个标记，那就是她
+            ids |= tags
+
+    def _quotes_me(self, raw: dict, group: str) -> bool:
+        """引用了鱼鱼说过的话，也算在跟她说。QQ 有时不给被引用消息的作者，就和她自己说过的话对一下。"""
+        if raw.get("message_type") != 103:
+            return False
+        for el in raw.get("msg_elements") or []:
+            content = el.get("content") or ""
+            if RECENT_BLOCK.search(content):
+                continue
+            who = el.get("author")
+            if who:
+                if who.get("bot") and who.get("username") == self._my_name():
+                    return True
+            elif self.brain.said_recently(group, _clean_attached(content)):
+                return True
+        return False
+
+    def _sample_group_event(self, raw: dict, kind: str):
+        """每种群消息留几条原样的，存档里能用 tools/logs.py --samples 核对（够数就不再记）。"""
+        samples = self.brain.meta.setdefault("group_samples", {}).setdefault(kind, [])
+        if len(samples) >= 3:
+            return
+        keep = {k: raw.get(k) for k in ("message_type", "content", "mentions", "author", "attachments", "msg_elements")}
+        keep["content"] = (keep["content"] or "")[:500]
+        samples.append(keep)
+        self.brain.memory.dirty = True
+
     async def _on_group(self, message: RawGroupMessage, at_event: bool):
         """群消息统一入口。三种「群消息范围」设置都走这里：
-        仅 @ 消息（只有 @ 事件）、@ 时附带最近消息（附带的在 msg_elements 里）、全部消息（全量事件，@ 事件可能也来）。"""
+        仅 @ 消息（只有 @ 事件）、@ 时附带最近消息（附带的在 msg_elements 里）、全部消息（全量事件，@ 事件可能也来）。
+        同一条 @ 消息可能两个事件都推，先后不定：回过的不再回，只记录过的（全量事件先到却没认出 @）还能回。"""
         raw = message.raw
-        if message.id in self.seen_ids:  # 同一条消息两个事件都推的话只处理一次
-            return
-        self.seen_ids.append(message.id)
         group, author = message.group_openid, raw.get("author") or {}
-        if raw.get("msg_elements") and self.raw_logged < 5:  # 附带消息的格式文档没写清，先记几条原样的方便核对
-            self.raw_logged += 1
-            sample = {k: raw.get(k) for k in ("message_type", "msg_elements", "message_scene")}
-            log.info("群消息附带内容（原样）：%s", json.dumps(sample, ensure_ascii=False)[:1500])
-            samples = self.brain.meta.setdefault("raw_samples", [])
-            samples.append(sample)
-            del samples[:-5]
-        for name, text, atts in attached_messages(raw, message.content or ""):  # 附带的最近消息、引用，也当群上下文
-            self.brain.log_group_line(group, name, text, dedupe=True)
-            self.remember_group_images(group, atts)
+        print_id = (author.get("member_openid"), raw.get("timestamp"), message.content)  # 万一两个事件的 id 不同
+        if message.id in self.seen_ids or print_id in self.seen_ids:
+            return
+        if author.get("bot") and (author.get("username") == self._my_name() or author.get("id") == getattr(self.robot, "id", None)):
+            return  # 鱼鱼自己发的，回复后已经记过了
+        if not at_event and group not in self.full_groups:
+            self.full_groups.add(group)
+            log.info("群 %s 收到全量消息，这个群开了「获取群内全部消息」", group)
+        self._learn_my_ids(group, raw, at_event)
+        my_ids = self._my_ids(group)
+        first_time = message.id not in self.logged_ids
+        rendered = render_ats(message.content or "", raw.get("mentions") or [], my_ids)
+        spoken = voice_text(raw)
+        if first_time:
+            if raw.get("msg_elements") and self.raw_logged < 5:  # 附带消息的格式文档没写清，先记几条原样的方便核对
+                self.raw_logged += 1
+                sample = {k: raw.get(k) for k in ("message_type", "msg_elements", "message_scene")}
+                log.info("群消息附带内容（原样）：%s", json.dumps(sample, ensure_ascii=False)[:1500])
+                samples = self.brain.meta.setdefault("raw_samples", [])
+                samples.append(sample)
+                del samples[:-5]
+            for name, line, atts in attached_messages(raw, message.content or ""):  # 附带的最近消息、引用，也当群上下文
+                self.brain.log_group_line(group, name, line, dedupe=True)
+                self.remember_group_images(group, atts)
         own_atts = [{"url": a.url if a.url.startswith("http") else "https://" + a.url.lstrip("/"),
                      "sticker": "gif" in (a.content_type or "") or "faceType=6" in (message.content or "")}
                     for a in message.attachments or [] if (a.content_type or "").startswith("image") and a.url]
-        text = _label(decode_faces(AT_TAG.sub("", STICKER_FACE.sub("", message.content or ""))).strip(), own_atts)
+        plain = decode_faces(STICKER_FACE.sub("", rendered)).strip()
+        text = _label(" ".join(x for x in (plain, media_note(raw)) if x), own_atts)
         speaker = self.brain.group_speaker(author)
-        if not (at_event or mentions_bot(raw)):
-            self.brain.log_group_line(group, speaker, text)
-            self.remember_group_images(group, own_atts)
-            return  # 没 @ 鱼鱼，只记录不回复
+        to_me = (at_event or mentions_me(raw, my_ids) or bool(NAME_CALL.match(plain or spoken))
+                 or self._quotes_me(raw, group))
+        self._sample_group_event(raw, "at_event" if at_event else "full_to_me" if to_me else "full_plain")
+        if author.get("bot") or not to_me:  # 别的机器人说的话只听不回，免得两个机器人没完没了
+            if first_time:
+                self.logged_ids.append(message.id)
+                self.brain.log_group_line(group, speaker, text)
+                self.remember_group_images(group, own_atts)
+            return
+        self.seen_ids.extend((message.id, print_id))
         # @ 鱼鱼时自己没带图、又提到图/表情包（「看看上文表情包」），就把群里最近的几张拿来看
         if not own_atts and LOOK_BACK.search(text):
             message.context_images = list(self.group_images.get(group, []))[-LOOK_BACK_MAX:]
+        message.content = " ".join(x for x in (rendered.strip(), spoken) if x)
         uid = message.author.member_openid
         ctx = Context(user_id=uid, session_id=f"g:{group}:{uid}", target_kind="group", target_id=group,
                       is_group=True, union_id=message.author.union_openid or "")

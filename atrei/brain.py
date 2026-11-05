@@ -23,7 +23,8 @@ from .tools import IMAGE_TOOL, WEEKDAYS, Context, StickerLibrary, ToolBox, tool_
 
 log = logging.getLogger("atrei")
 
-GROUP_CONTEXT = 12  # 群里记最近这么多条别人的聊天
+GROUP_CONTEXT = 30  # 群里记最近这么多条聊天（全量模式下群聊多，12 条一下就刷没了）
+GROUP_CONTEXT_MAX_AGE = 3 * 3600  # 超过这么久的群聊不算「刚才」，不拿给她看
 MAX_TOOL_ROUNDS = 4  # 查资料 → 回答 → 配表情包，最多来回几次
 FACE_CHANCE = 0.4  # 大约四成消息带一个 QQ 小黄脸
 
@@ -66,7 +67,7 @@ SYSTEM = """你是「{name}」：拟人化的 DeepSeek 鲸鱼娘，深蓝长发�
 OWNER_ONLY_FACTS = (
     "（只告诉主人的幕后资料：你的脑子是 DeepSeek V4.1 Flash，开着最高档思考；你住在 Render 免费版的新加坡服务器上，"
     "代码在主人的 GitHub 仓库 juanhanyu/dafeiyu；表情包来自 dsh-nekowhale-stickers 和 dsh-meme 两个大肥鱼表情库；"
-    "声音是 BreezeBlue 的「大肥鱼（迷糊版）」；画画是借 Codex 找 GPT 姐姐画的，每天最多 20 张；"
+    "声音是 BreezeBlue 的「大肥鱼（迷糊版）」；画画是借 Codex 找 GPT 姐姐画的，每天最多 30 张；"
     "聊天记忆存在主人 Hugging Face 的私有数据集里，重启也不会忘。各种密钥你从来看不到，也不知道。）"
 )
 
@@ -191,9 +192,11 @@ class Brain:
             who += ("这是在群里，大家都能看到。跟群友聊天时就正常跟对方聊，别句句提主人、别老说自己是主人的鱼，"
                     "称呼对方「你」就好；只有话题真的扯到主人、或者对方问起时才提。"
                     "群里说话比私聊更短：一般就一句话、十几个字，像群聊里随口接话那样。")
-            recent = self.group_logs.get(ctx.target_id)
+            now = time.time()
+            recent = [(n, t) for n, t, at in self.group_logs.get(ctx.target_id, ()) if now - at < GROUP_CONTEXT_MAX_AGE]
             if recent:
-                who += "\n群里刚才在聊（你是被 @ 了才开口的，可以顺着话题接）：\n" + "\n".join(f"{n}：{t}" for n, t in recent)
+                who += ("\n群里刚才在聊（你是被叫到了才开口的，可以顺着话题接；别人之间的对话不用逐条回应）：\n"
+                        + "\n".join(f"{n}：{t}" for n, t in recent))
         who += "\n" + self.life.state(owner)
         who += self.longterm.prompt_block(person_key(owner, ctx.user_id))
         return SYSTEM.format(
@@ -363,11 +366,16 @@ class Brain:
             return
         logs = self.group_logs[group_id]
         key = text[:30]
-        if dedupe and any(t[:30] == key or key in t for _, t in logs):
+        if dedupe and any(t[:30] == key or key in t for _, t, _ in logs):
             return
         if name is None:
             name = "群友"
-        logs.append((name, text[:100]))
+        logs.append((name, text[:100], time.time()))
+
+    def said_recently(self, group_id: str, text: str) -> bool:
+        """这句话是不是鱼鱼刚才在这个群说过的（判断别人引用的是不是她）。"""
+        key = text[:12]
+        return bool(key) and any(n.startswith("你（") and key in t for n, t, _ in self.group_logs.get(group_id, ()))
 
     def _remember_turn(self, session_id: str, turn: list[dict]):
         history = self.histories[session_id]
