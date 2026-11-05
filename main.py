@@ -419,7 +419,7 @@ class AtreiClient(botpy.Client):
             self.pace.busy.add(group)
         self.seen_ids.extend((message.id, print_id))
         # @ 鱼鱼时自己没带图、又提到图/表情包（「看看上文表情包」），就把群里最近的几张拿来看
-        if not own_atts and LOOK_BACK.search(text):
+        if not optional and not own_atts and LOOK_BACK.search(text):
             message.context_images = list(self.group_images.get(group, []))[-LOOK_BACK_MAX:]
         message.content = " ".join(x for x in (rendered.strip(), spoken) if x)
         ctx = Context(user_id=uid, session_id=f"g:{group}:{uid}", target_kind="group", target_id=group,
