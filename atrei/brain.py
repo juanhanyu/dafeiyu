@@ -192,8 +192,8 @@ class Brain:
             who += ("这是在群里，大家都能看到。跟群友聊天时就正常跟对方聊，别句句提主人、别老说自己是主人的鱼，"
                     "称呼对方「你」就好；只有话题真的扯到主人、或者对方问起时才提。"
                     "群里说话比私聊更短：一般就一句话、十几个字，像群聊里随口接话那样。")
-            now = time.time()
-            recent = [(n, t) for n, t, at in self.group_logs.get(ctx.target_id, ()) if now - at < GROUP_CONTEXT_MAX_AGE]
+            cutoff = time.time() - GROUP_CONTEXT_MAX_AGE
+            recent = [(n, t) for n, t, at in self.group_logs.get(ctx.target_id, ()) if at > cutoff]
             if recent:
                 who += ("\n群里刚才在聊（你是被叫到了才开口的，可以顺着话题接；别人之间的对话不用逐条回应）：\n"
                         + "\n".join(f"{n}：{t}" for n, t in recent))
